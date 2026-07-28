@@ -3,6 +3,7 @@
 use std::io;
 use serde::{Deserialize, Serialize};
 use crate::{io_err, KmeId, SaeClientCertSerial, SaeId};
+use crate::zenoh_transport::config::ZenohTransportConfig;
 
 /// Whole KME config, to be extracted from JSON
 #[derive(Serialize, Deserialize, Debug)]
@@ -55,6 +56,30 @@ pub struct ThisKmeConfig {
     pub kmes_https_interface: KMEsHttpsInterfaceConfig,
     /// Optional HTTP interface to see important debugging events
     pub debugging_http_interface: Option<String>,
+    /// Optional Zenoh transport configuration used when the Zenoh+Raft mode is selected
+    #[serde(default)]
+    pub zenoh_transport: Option<ZenohTransportConfig>,
+    /// Transport mode used at startup
+    /// Defaults to HTTPS to keep backward compatibility with existing configurations
+    #[serde(default)]
+    pub transport_mode: TransportMode,
+}
+
+/// Transport mode used to start the server stack
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum TransportMode {
+    /// Start the existing HTTPS-based stack
+    #[serde(alias = "https")]
+    Https,
+    /// Start the Zenoh-based stack
+    ZenohRaft,
+}
+
+impl Default for TransportMode {
+    fn default() -> Self {
+        Self::Https
+    }
 }
 
 /// Config for internal HTTPS interface for SAEs (likely secured local network)
@@ -133,6 +158,7 @@ mod tests {
         assert_eq!(config.this_kme_config.kmes_https_interface.server_cert_path, "certs/inter_kmes/kme1_server.crt");
         assert_eq!(config.this_kme_config.kmes_https_interface.server_key_path, "certs/inter_kmes/kme1_server.key");
         assert_eq!(config.this_kme_config.debugging_http_interface, Some("127.0.0.1:8080".to_string()));
+        assert_eq!(config.this_kme_config.transport_mode, super::TransportMode::Https);
         assert_eq!(config.other_kme_configs.len(), 1);
         assert_eq!(config.other_kme_configs[0].id, 2);
         assert_eq!(config.other_kme_configs[0].key_directory_to_watch, "tests/data/raw_keys/kme-1-2");

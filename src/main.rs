@@ -1,8 +1,11 @@
 use std::sync::Arc;
 use log::error;
+use log::info;
 use tokio::select;
 use qkd_kme_server::event_subscription::ImportantEventSubscriber;
 use qkd_kme_server::qkd_manager::QkdManager;
+use qkd_kme_server::config::TransportMode;
+use qkd_kme_server::zenoh_transport::ZenohTransport;
 use qkd_kme_server::routes::sae_zone_routes::EtsiSaeQkdRoutesV1;
 use qkd_kme_server::routes::inter_kmes_routes::InterKMEsRoutes;
 use qkd_kme_server::server::auth_https_server::AuthHttpsServer;
@@ -41,30 +44,46 @@ async fn main() {
 
     let qkd_manager = QkdManager::from_config(&config).await.unwrap();
 
-    match config.this_kme_config.debugging_http_interface {
-        Some(listen_addr) => {
-            let logging_http_server = Arc::new(LoggingHttpServer::new(&listen_addr));
-            qkd_manager.add_important_event_subscriber(Arc::clone(&logging_http_server) as Arc<dyn ImportantEventSubscriber>).await.unwrap();
-            select! {
-                x = inter_kme_https_server.run(&qkd_manager) => {
-                    error!("Error running inter-KMEs HTTPS server: {:?}", x);
-                },
-                x = sae_https_server.run(&qkd_manager) => {
-                    error!("Error running SAEs HTTPS server: {:?}", x);
-                },
-                x = logging_http_server.run() => {
-                    error!("Error running logging HTTP server: {:?}", x);
+    info!(
+        "Startup transport mode: {:?}, zenoh config present: {}",
+        config.this_kme_config.transport_mode,
+        config.this_kme_config.zenoh_transport.is_some()
+    );
+
+    match config.this_kme_config.transport_mode {
+        TransportMode::Https => {
+            match config.this_kme_config.debugging_http_interface {
+                Some(listen_addr) => {
+                    let logging_http_server = Arc::new(LoggingHttpServer::new(&listen_addr));
+                    qkd_manager.add_important_event_subscriber(Arc::clone(&logging_http_server) as Arc<dyn ImportantEventSubscriber>).await.unwrap();
+                    select! {
+                        x = inter_kme_https_server.run(&qkd_manager) => {
+                            error!("Error running inter-KMEs HTTPS server: {:?}", x);
+                        },
+                        x = sae_https_server.run(&qkd_manager) => {
+                            error!("Error running SAEs HTTPS server: {:?}", x);
+                        },
+                        x = logging_http_server.run() => {
+                            error!("Error running logging HTTP server: {:?}", x);
+                        }
+                    }
+                }
+                None => {
+                    select! {
+                        x = inter_kme_https_server.run(&qkd_manager) => {
+                            error!("Error running inter-KMEs HTTPS server: {:?}", x);
+                        },
+                        x = sae_https_server.run(&qkd_manager) => {
+                            error!("Error running SAEs HTTPS server: {:?}", x);
+                        }
+                    }
                 }
             }
-        },
-        None => {
-            select! {
-                x = inter_kme_https_server.run(&qkd_manager) => {
-                    error!("Error running inter-KMEs HTTPS server: {:?}", x);
-                },
-                x = sae_https_server.run(&qkd_manager) => {
-                    error!("Error running SAEs HTTPS server: {:?}", x);
-                }
+        }
+        TransportMode::ZenohRaft => {
+            let zenoh_config = config.this_kme_config.zenoh_transport.clone().unwrap_or_default();
+            if let Err(e) = ZenohTransport::start(zenoh_config).await {
+                error!("Error starting Zenoh transport skeleton: {}", e);
             }
         }
     }
