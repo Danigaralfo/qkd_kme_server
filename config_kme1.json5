@@ -12,7 +12,11 @@
       "peers": ["tcp/127.0.0.1:7448"],
       "role": "peer",
       "probe_remote_node_id": "kme-2-zenoh", // Temporary contract probe: remote node to publish sample messages to
-      "probe_role": "initiator" // Temporary contract probe: this node publishes toward probe_remote_node_id
+      "probe_role": "initiator", // Temporary contract probe: this node publishes toward probe_remote_node_id
+      "raft": {
+        "cluster_members": ["kme-1-zenoh", "kme-2-zenoh"], // Node-ids participating in Raft consensus, including this node
+        "leader_id": "kme-1-zenoh" // Statically configured Raft leader (no election yet)
+      }
     },
     "saes_https_interface": {
       "listen_address": "0.0.0.0:13000", // Listening address for connections of SAEs belonging to this KME

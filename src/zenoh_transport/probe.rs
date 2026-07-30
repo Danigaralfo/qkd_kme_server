@@ -1,88 +1,80 @@
-//! This module is entirely a validation aid: it exercises the
-//! contract (`contract.rs`) end-to-end over a real Zenoh session so it can be
-//! checked that message shapes and topics work as designed, and it reflects a
-//! received state transition into a local placeholder value to validate the
-//! event flow (initial state -> event emitted -> event recieved -> new state comitted).
+//! This module is a validation aid that exercises the ETSI-020 plane of the
+//! contract (`contract.rs`) end-to-end over a real Zenoh session, and drives
+//! the real Raft-lite consensus in `raft.rs` through a full, realistic key
+//! lifecycle:
+//! 1. The initiator node generates a key locally (state `Generated`).
+//! 2. It asks the Raft cluster for permission to start syncing it
+//!    ([`raft::propose_transition_and_await_decision`], `Generated -> Syncing`).
+//! 3. Once committed, it hands the key material to the remote node over the
+//!    ETSI-020 plane (`ext_keys` topic) and waits for that node's ack.
+//! 4. It asks the cluster for permission to mark the key in use
+//!    (`Syncing -> InUse`).
+//! 5. It "uses" the key (a no-op here), then asks the cluster for permission
+//!    to mark it deleted/used (`InUse -> DeletedOrUsed`) and tells the remote
+//!    node to void its copy (`ext_keys_void` topic).
+//!
+//! All Raft message exchange and state-transition validation is delegated to
+//! `raft.rs` (via `propose_transition_and_await_decision`); this module only
+//! owns the ETSI-020 send/ack/void round-trip and the sequencing of the demo
+//! itself, since no other module drives that plane automatically yet.
 //!
 //! None of this is final business logic: real topic wiring must be driven
-//! automatically by `QkdManager` (ETSI-020 requests) and, eventually, Raft
-//! cluster membership, not by this hardcoded probe. Keeping it in its own
-//! module (separate from `runtime.rs`, which only bootstraps the real Zenoh node)
+//! automatically by `QkdManager` (ETSI-020 requests), not by this hardcoded
+//! probe. Keeping it in its own module (separate from `runtime.rs`, which
+//! only bootstraps the real Zenoh node) means it can be discarded on its own
+//! once that real wiring exists.
 
 use crate::io_err;
 use log::{error, info};
 use std::io;
-use std::sync::{Arc, Mutex};
+use std::time::Duration;
 use uuid::Uuid;
 
 use super::config::{ZenohProbeRole, ZenohTransportConfig};
 use super::contract::{
     ZenohEtsiExtKeysAck, ZenohEtsiExtKeysBatch, ZenohEtsiExtKeysVoid, ZenohEtsiKeyMaterial,
-    ZenohKeyState, ZenohRaftMessageKind, ZenohRaftStateUpdate, ZenohRaftTransitionDecision,
-    ZenohRaftTransitionRequest, ZenohTopicMap,
+    ZenohKeyState, ZenohRaftMessageKind, ZenohTopicMap,
 };
+use super::raft;
 
-/// Placeholder key-id used to simulate a single local key's state for the
-/// event-flow validation. This will be replaced by real key-ids
-/// coming from `QkdManager`'s key storage once this transport is wired to it.
-const PLACEHOLDER_KEY_ID: &str = "2c0ac81f-1a2f-49a2-b881-f18a6d620b65";
+/// How often every node announces its own presence on its own Raft presence topic.
+const PRESENCE_INTERVAL: Duration = Duration::from_secs(5);
 
-/// Contract topics owned by a single node hostname, used to know where to
-/// publish sample messages during the probe.
+/// How often the initiator runs a full key lifecycle demo pass, end to end.
 ///
-/// This grouping only exists to support the probe below: it is not the final
-/// routing model, where topics will be resolved per-request from
-/// `other_kmes` and Raft cluster membership instead of being enumerated
-/// upfront for a single peer.
-#[derive(Clone)]
-struct ContractTopics {
-    version: String,
-    ext_keys: String,
-    ext_keys_ack: String,
-    ext_keys_void: String,
-    raft_presence: String,
-    raft_transition_request: String,
-    raft_transition_decision: String,
-    raft_state_update: String,
-}
+/// This must comfortably exceed [`RAFT_DECISION_TIMEOUT`] and
+/// [`ETSI_ACK_TIMEOUT`] combined (the demo makes three Raft round-trips and
+/// one ETSI-020 round-trip per pass) so passes never overlap.
+const LIFECYCLE_LOOP_INTERVAL: Duration = Duration::from_secs(30);
 
-impl ContractTopics {
-    fn for_node(node_id: &str) -> Self {
-        Self {
-            version: ZenohTopicMap::version_query_topic(node_id),
-            ext_keys: ZenohTopicMap::ext_keys_topic(node_id),
-            ext_keys_ack: ZenohTopicMap::ext_keys_ack_topic(node_id),
-            ext_keys_void: ZenohTopicMap::ext_keys_void_topic(node_id),
-            raft_presence: ZenohTopicMap::raft_presence_topic(node_id),
-            raft_transition_request: ZenohTopicMap::raft_transition_request_topic(node_id),
-            raft_transition_decision: ZenohTopicMap::raft_transition_decision_topic(node_id),
-            raft_state_update: ZenohTopicMap::raft_state_update_topic(node_id),
-        }
-    }
-}
+/// How long the demo waits for the Raft cluster to decide on a proposed transition.
+const RAFT_DECISION_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// How long the demo waits for the remote node to ack a published key batch.
+const ETSI_ACK_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Start the probe behavior on top of an already-initialized Zenoh session.
 ///
-/// This always subscribes to this node's own `raft_state_update` topic to
-/// reflect any received transition into a local placeholder key state. If
-/// configured as `probe_role: initiator` with a `probe_remote_node_id`, it
-/// additionally publishes one sample message per Pub/Sub contract topic on a
-/// fixed interval toward the remote node's topics. If configured as
-/// `probe_role: responder` with a `probe_remote_node_id`, it actively queries
-/// the remote (master) node's version topic instead of waiting for a
-/// publication, since `/kmapi/version` is never published to.
+/// Every node, regardless of role, subscribes to its own `ext_keys` and
+/// `ext_keys_void` topics so it can act as the "slave" side of the ETSI-020
+/// exchange for whichever node addresses it. If configured as `probe_role:
+/// initiator` with a `probe_remote_node_id`, this node additionally runs the
+/// full key lifecycle demo on a fixed interval toward the remote node. If
+/// configured as `probe_role: responder` with a `probe_remote_node_id`, it
+/// actively queries the remote (master) node's version topic once, since
+/// `/kmapi/version` is never published to.
 pub(super) async fn spawn(config: &ZenohTransportConfig, session: &zenoh::Session) -> Result<(), io::Error> {
-    let local_key_state = Arc::new(Mutex::new(ZenohKeyState::Generated));
-    spawn_raft_state_update_subscriber(config.node_id.clone(), session, local_key_state.clone()).await?;
+    spawn_presence_publisher(config.node_id.clone(), session.clone());
+    spawn_ext_keys_responder(config.node_id.clone(), session.clone()).await?;
+    spawn_ext_keys_void_responder(config.node_id.clone(), session.clone()).await?;
 
     match (&config.probe_role, &config.probe_remote_node_id) {
         (ZenohProbeRole::Initiator, Some(remote_node_id)) => {
             info!(
-                "Zenoh contract probe: node '{}' acting as initiator toward '{}'",
+                "Zenoh contract probe: node '{}' acting as initiator of the key lifecycle demo toward '{}'",
                 config.node_id, remote_node_id
             );
-            let remote_topics = ContractTopics::for_node(remote_node_id.as_str());
-            spawn_periodic_probe_publisher(config.node_id.clone(), session.clone(), remote_topics, local_key_state);
+            spawn_key_lifecycle_loop(config.clone(), session.clone(), remote_node_id.clone());
         }
         (ZenohProbeRole::Initiator, None) => {
             error!(
@@ -95,8 +87,7 @@ pub(super) async fn spawn(config: &ZenohTransportConfig, session: &zenoh::Sessio
                 "Zenoh contract probe: node '{}' acting as responder, querying version from master '{}'",
                 config.node_id, remote_node_id
             );
-            let remote_topics = ContractTopics::for_node(remote_node_id.as_str());
-            query_remote_version(session, &remote_topics).await?;
+            query_remote_version(session, remote_node_id.as_str()).await?;
         }
         (ZenohProbeRole::Responder, None) => {
             info!(
@@ -109,12 +100,34 @@ pub(super) async fn spawn(config: &ZenohTransportConfig, session: &zenoh::Sessio
     Ok(())
 }
 
+/// Spawn a background task that periodically announces this node's own
+/// presence on its own Raft presence topic. Each node announces itself on
+/// its own topic (as opposed to publishing onto a remote node's topic),
+/// since presence is inherently something a node reports about itself.
+fn spawn_presence_publisher(node_id: String, session: zenoh::Session) {
+    let topic = ZenohTopicMap::raft_presence_topic(node_id.as_str());
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(PRESENCE_INTERVAL);
+        loop {
+            interval.tick().await;
+            let payload = serde_json::json!({
+                "kind": ZenohRaftMessageKind::Presence,
+                "node_id": node_id,
+                "plane": "raft",
+            });
+            if let Err(e) = publish_json(&session, topic.as_str(), &payload, "Zenoh raft presence").await {
+                error!("Zenoh presence publisher '{}': failed to publish presence: {e}", node_id);
+            }
+        }
+    });
+}
+
 /// Actively query a remote (master) node's `/kmapi/version` topic and log the reply.
-async fn query_remote_version(session: &zenoh::Session, remote_topics: &ContractTopics) -> Result<(), io::Error> {
-    let topic = remote_topics.version.as_str();
+async fn query_remote_version(session: &zenoh::Session, remote_node_id: &str) -> Result<(), io::Error> {
+    let topic = ZenohTopicMap::version_query_topic(remote_node_id);
     info!("Zenoh version query -> querying '{topic}'");
     let replies = session
-        .get(topic)
+        .get(topic.as_str())
         .await
         .map_err(|e| io_err(&format!("Cannot query Zenoh version topic '{topic}': {e}")))?;
 
@@ -131,19 +144,161 @@ async fn query_remote_version(session: &zenoh::Session, remote_topics: &Contract
     Ok(())
 }
 
-/// Subscribe to this node's own `raft_state_update` topic and reflect any
-/// received transition into the local placeholder key state.
-///
-/// This validates event flow (event received -> new state comitted) 
-/// with a single in-memory placeholder value: it is
-/// not the final state store, which will read/write `QkdManager`'s real
-/// key storage once this transport is wired to it.
-async fn spawn_raft_state_update_subscriber(
-    node_id: String,
+/// Spawn a background task that repeatedly runs a full key lifecycle demo
+/// pass toward `remote_node_id`, using a freshly generated key-id each time
+/// (a key-id cannot be reused once it reaches the terminal `DeletedOrUsed`
+/// state).
+fn spawn_key_lifecycle_loop(config: ZenohTransportConfig, session: zenoh::Session, remote_node_id: String) {
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(LIFECYCLE_LOOP_INTERVAL);
+        loop {
+            interval.tick().await;
+            if let Err(e) = run_key_lifecycle_demo(&config, &session, remote_node_id.as_str()).await {
+                error!("Zenoh key lifecycle demo: node '{}' pass failed: {e}", config.node_id);
+            }
+        }
+    });
+}
+
+/// Run one full pass of the Raft-gated ETSI-020 key lifecycle demo described
+/// in this module's doc comment. All Raft consensus is delegated to
+/// [`raft::propose_transition_and_await_decision`]; this function only owns
+/// the ETSI-020 send/ack/void round-trip and the sequencing between steps.
+async fn run_key_lifecycle_demo(config: &ZenohTransportConfig, session: &zenoh::Session, remote_node_id: &str) -> Result<(), io::Error> {
+    let key_id = Uuid::new_v4().to_string();
+    info!("Zenoh key lifecycle demo: node '{}' generated key '{}' (state Generated)", config.node_id, key_id);
+
+    // Generated -> Syncing: ask the cluster for permission to start the exchange.
+    let decision = raft::propose_transition_and_await_decision(
+        config,
+        session,
+        key_id.as_str(),
+        remote_node_id,
+        ZenohKeyState::Generated,
+        ZenohKeyState::Syncing,
+        RAFT_DECISION_TIMEOUT,
+    )
+    .await?;
+    if !decision.accepted {
+        error!(
+            "Zenoh key lifecycle demo: cluster rejected Generated -> Syncing for key '{}': {:?}",
+            key_id, decision.reason
+        );
+        return Ok(());
+    }
+    info!("Zenoh key lifecycle demo: cluster committed key '{}' to Syncing", key_id);
+
+    // Hand the key material to the remote node over the ETSI-020 plane and wait for its ack.
+    send_ext_keys_and_await_ack(session, config.node_id.as_str(), remote_node_id, key_id.as_str(), ETSI_ACK_TIMEOUT).await?;
+    info!("Zenoh key lifecycle demo: '{}' acknowledged receipt of key '{}'", remote_node_id, key_id);
+
+    // Syncing -> InUse: ask the cluster for permission to start using the key.
+    let decision = raft::propose_transition_and_await_decision(
+        config,
+        session,
+        key_id.as_str(),
+        remote_node_id,
+        ZenohKeyState::Syncing,
+        ZenohKeyState::InUse,
+        RAFT_DECISION_TIMEOUT,
+    )
+    .await?;
+    if !decision.accepted {
+        error!(
+            "Zenoh key lifecycle demo: cluster rejected Syncing -> InUse for key '{}': {:?}",
+            key_id, decision.reason
+        );
+        return Ok(());
+    }
+    info!("Zenoh key lifecycle demo: cluster committed key '{}' to InUse; key would be used here", key_id);
+
+    // InUse -> DeletedOrUsed: ask the cluster for permission to retire the key, then tell the
+    // remote node to void its copy.
+    let decision = raft::propose_transition_and_await_decision(
+        config,
+        session,
+        key_id.as_str(),
+        remote_node_id,
+        ZenohKeyState::InUse,
+        ZenohKeyState::DeletedOrUsed,
+        RAFT_DECISION_TIMEOUT,
+    )
+    .await?;
+    if !decision.accepted {
+        error!(
+            "Zenoh key lifecycle demo: cluster rejected InUse -> DeletedOrUsed for key '{}': {:?}",
+            key_id, decision.reason
+        );
+        return Ok(());
+    }
+    let void = ZenohEtsiExtKeysVoid {
+        request_id: Uuid::new_v4().to_string(),
+        key_ids: vec![key_id.clone()],
+        reason: String::from("key used, lifecycle demo complete"),
+    };
+    let void_topic = ZenohTopicMap::ext_keys_void_topic(remote_node_id);
+    publish_json(session, void_topic.as_str(), &void, "Zenoh ext_keys void").await?;
+    info!("Zenoh key lifecycle demo: key '{}' lifecycle complete (DeletedOrUsed)", key_id);
+
+    Ok(())
+}
+
+/// Publish an ETSI-020 key batch carrying `key_id` to `remote_node_id` and
+/// block (up to `timeout`) until that node acknowledges it.
+async fn send_ext_keys_and_await_ack(
     session: &zenoh::Session,
-    local_key_state: Arc<Mutex<ZenohKeyState>>,
+    own_node_id: &str,
+    remote_node_id: &str,
+    key_id: &str,
+    timeout: Duration,
 ) -> Result<(), io::Error> {
-    let topic = ZenohTopicMap::raft_state_update_topic(node_id.as_str());
+    // Subscribe to our own ack topic *before* publishing the batch, so a fast
+    // responder can never ack before we start listening for it.
+    let ack_topic = ZenohTopicMap::ext_keys_ack_topic(own_node_id);
+    let subscriber = session
+        .declare_subscriber(ack_topic.as_str())
+        .await
+        .map_err(|e| io_err(&format!("Cannot declare Zenoh subscriber: {e}")))?;
+
+    let batch = ZenohEtsiExtKeysBatch {
+        request_id: Uuid::new_v4().to_string(),
+        master_kme: own_node_id.to_string(),
+        slave_kme: remote_node_id.to_string(),
+        keys: vec![ZenohEtsiKeyMaterial {
+            key_id: key_id.to_string(),
+            key_b64: String::from("ZHVtbXkta2V5LW1hdGVyaWFs"),
+        }],
+    };
+    let batch_topic = ZenohTopicMap::ext_keys_topic(remote_node_id);
+    publish_json(session, batch_topic.as_str(), &batch, "Zenoh ext_keys batch").await?;
+
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        if remaining.is_zero() {
+            return Err(io_err(&format!("Timed out waiting for ext_keys ack for request '{}'", batch.request_id)));
+        }
+        let sample = match tokio::time::timeout(remaining, subscriber.recv_async()).await {
+            Ok(Ok(sample)) => sample,
+            Ok(Err(_)) => return Err(io_err("Zenoh ext_keys ack subscriber closed unexpectedly")),
+            Err(_) => return Err(io_err(&format!("Timed out waiting for ext_keys ack for request '{}'", batch.request_id))),
+        };
+        match sample.payload().try_to_string() {
+            Ok(payload) => match serde_json::from_str::<ZenohEtsiExtKeysAck>(&payload) {
+                Ok(ack) if ack.request_id == batch.request_id => return Ok(()),
+                Ok(_unrelated_ack) => continue,
+                Err(e) => error!("Zenoh ext_keys client '{}' <- cannot parse ack on '{ack_topic}': {e}", own_node_id),
+            },
+            Err(_) => info!("Zenoh ext_keys client '{}' <- received non-UTF8 ack on '{ack_topic}'", own_node_id),
+        }
+    }
+}
+
+/// Slave-side: subscribe to this node's own `ext_keys` topic and, on every
+/// received batch, log receipt of the key material and ack it back to the
+/// batch's `master_kme`.
+async fn spawn_ext_keys_responder(node_id: String, session: zenoh::Session) -> Result<(), io::Error> {
+    let topic = ZenohTopicMap::ext_keys_topic(node_id.as_str());
     let subscriber = session
         .declare_subscriber(topic.as_str())
         .await
@@ -152,154 +307,61 @@ async fn spawn_raft_state_update_subscriber(
     tokio::spawn(async move {
         while let Ok(sample) = subscriber.recv_async().await {
             match sample.payload().try_to_string() {
-                Ok(payload) => match serde_json::from_str::<ZenohRaftStateUpdate>(&payload) {
-                    Ok(update) => {
-                        let previous_state = {
-                            let mut state = local_key_state.lock().unwrap();
-                            let previous = *state;
-                            *state = update.state;
-                            previous
-                        };
+                Ok(payload) => match serde_json::from_str::<ZenohEtsiExtKeysBatch>(&payload) {
+                    Ok(batch) => {
                         info!(
-                            "Zenoh raft_state_update '{}' <- received on '{topic}' for key '{}': {:?} -> {:?} (committed: {})",
-                            node_id, update.key_id, previous_state, update.state, update.committed
+                            "Zenoh ext_keys responder '{}': received {} key(s) from '{}' (request '{}')",
+                            node_id,
+                            batch.keys.len(),
+                            batch.master_kme,
+                            batch.request_id
                         );
+                        let ack = ZenohEtsiExtKeysAck {
+                            request_id: batch.request_id.clone(),
+                            received_keys: batch.keys.len(),
+                        };
+                        let ack_topic = ZenohTopicMap::ext_keys_ack_topic(batch.master_kme.as_str());
+                        if let Err(e) = publish_json(&session, ack_topic.as_str(), &ack, "Zenoh ext_keys ack").await {
+                            error!("Zenoh ext_keys responder '{}': failed to publish ack for '{}': {e}", node_id, batch.request_id);
+                        }
                     }
-                    Err(e) => error!(
-                        "Zenoh raft_state_update '{}' <- cannot parse payload on '{topic}': {e}",
-                        node_id
-                    ),
+                    Err(e) => error!("Zenoh ext_keys responder '{}' <- cannot parse batch on '{topic}': {e}", node_id),
                 },
-                Err(_) => info!(
-                    "Zenoh raft_state_update '{}' <- received non-UTF8 payload on '{topic}': {:?}",
-                    node_id,
-                    sample.payload().to_bytes()
-                ),
+                Err(_) => info!("Zenoh ext_keys responder '{}' <- received non-UTF8 payload on '{topic}'", node_id),
             }
         }
-        error!("Zenoh raft_state_update '{}' subscriber loop ended unexpectedly", node_id);
+        error!("Zenoh ext_keys responder '{}' subscriber loop ended unexpectedly", node_id);
     });
 
     Ok(())
 }
 
-/// Spawn a background task that republishes the Pub/Sub probe messages on
-/// a fixed interval toward `remote_topics`.
-///
-/// A single one-shot publish can race with Zenoh's peer/subscriber
-/// discovery (the remote node may not have declared its subscribers yet
-/// when the first sample is sent), so nothing would ever be observed on
-/// the receiving side. Repeating the publish keeps the Pub/Sub topics
-/// continuously visible in the logs on both nodes for as long as the
-/// probe runs.
-fn spawn_periodic_probe_publisher(
-    node_id: String,
-    session: zenoh::Session,
-    remote_topics: ContractTopics,
-    local_key_state: Arc<Mutex<ZenohKeyState>>,
-) {
+/// Slave-side: subscribe to this node's own `ext_keys_void` topic and log
+/// (simulating local deletion of) every key-id the master asks to void.
+async fn spawn_ext_keys_void_responder(node_id: String, session: zenoh::Session) -> Result<(), io::Error> {
+    let topic = ZenohTopicMap::ext_keys_void_topic(node_id.as_str());
+    let subscriber = session
+        .declare_subscriber(topic.as_str())
+        .await
+        .map_err(|e| io_err(&format!("Cannot declare Zenoh subscriber: {e}")))?;
+
     tokio::spawn(async move {
-        let mut interval = tokio::time::interval(std::time::Duration::from_secs(5));
-        loop {
-            interval.tick().await;
-            if let Err(e) = publish_probe_messages(node_id.as_str(), &session, &remote_topics, &local_key_state).await {
-                error!("Zenoh contract probe: failed to publish probe messages: {e}");
+        while let Ok(sample) = subscriber.recv_async().await {
+            match sample.payload().try_to_string() {
+                Ok(payload) => match serde_json::from_str::<ZenohEtsiExtKeysVoid>(&payload) {
+                    Ok(void) => info!(
+                        "Zenoh ext_keys_void responder '{}': voiding key(s) {:?} (reason: {})",
+                        node_id, void.key_ids, void.reason
+                    ),
+                    Err(e) => error!("Zenoh ext_keys_void responder '{}' <- cannot parse void on '{topic}': {e}", node_id),
+                },
+                Err(_) => info!("Zenoh ext_keys_void responder '{}' <- received non-UTF8 payload on '{topic}'", node_id),
             }
         }
+        error!("Zenoh ext_keys_void responder '{}' subscriber loop ended unexpectedly", node_id);
     });
-}
-
-async fn publish_probe_messages(
-    node_id: &str,
-    session: &zenoh::Session,
-    remote_topics: &ContractTopics,
-    local_key_state: &Arc<Mutex<ZenohKeyState>>,
-) -> Result<(), io::Error> {
-    let ext_keys_batch = ZenohEtsiExtKeysBatch {
-        request_id: Uuid::new_v4().to_string(),
-        master_kme: node_id.to_string(),
-        slave_kme: node_id.to_string(),
-        keys: vec![ZenohEtsiKeyMaterial {
-            key_id: Uuid::new_v4().to_string(),
-            key_b64: String::from("ZHVtbXkta2V5LW1hdGVyaWFs"),
-        }],
-    };
-    publish_json(session, remote_topics.ext_keys.as_str(), &ext_keys_batch, "Zenoh ext_keys batch").await?;
-
-    let ext_keys_ack = ZenohEtsiExtKeysAck {
-        request_id: ext_keys_batch.request_id.clone(),
-        received_keys: ext_keys_batch.keys.len(),
-    };
-    publish_json(session, remote_topics.ext_keys_ack.as_str(), &ext_keys_ack, "Zenoh ext_keys ack").await?;
-
-    let ext_keys_void = ZenohEtsiExtKeysVoid {
-        request_id: Uuid::new_v4().to_string(),
-        key_ids: vec![String::from("ZHVtbXkta2V5LW1hdGVyaWFs")],
-        reason: String::from("probe"),
-    };
-    publish_json(session, remote_topics.ext_keys_void.as_str(), &ext_keys_void, "Zenoh ext_keys void").await?;
-
-    let raft_presence_payload = serde_json::json!({
-        "kind": ZenohRaftMessageKind::Presence,
-        "node_id": node_id,
-        "plane": "raft",
-    });
-    publish_json(session, remote_topics.raft_presence.as_str(), &raft_presence_payload, "Zenoh raft presence").await?;
-
-    let raft_transition_request = ZenohRaftTransitionRequest {
-        request_id: Uuid::new_v4().to_string(),
-        key_id: Uuid::new_v4().to_string(),
-        master_kme: node_id.to_string(),
-        slave_kme: node_id.to_string(),
-        current_state: ZenohKeyState::Generated,
-        requested_state: ZenohKeyState::Syncing,
-    };
-    publish_json(session, remote_topics.raft_transition_request.as_str(), &raft_transition_request, "Zenoh raft transition request").await?;
-
-    let raft_transition_decision = ZenohRaftTransitionDecision {
-        request_id: raft_transition_request.request_id.clone(),
-        accepted: true,
-        reason: None,
-    };
-    publish_json(session, remote_topics.raft_transition_decision.as_str(), &raft_transition_decision, "Zenoh raft transition decision").await?;
-
-    publish_local_state_transition(session, remote_topics, raft_transition_request.request_id, local_key_state).await?;
 
     Ok(())
-}
-
-/// Transition this node's local placeholder key state and publish the
-/// resulting `ZenohRaftStateUpdate`.
-///
-/// This simulates "initial state -> event emitted" for a single
-/// placeholder key: the placeholder will be replaced by a real
-/// read/write against `QkdManager`'s key storage once this transport is
-/// wired to it.
-async fn publish_local_state_transition(
-    session: &zenoh::Session,
-    remote_topics: &ContractTopics,
-    request_id: String,
-    local_key_state: &Arc<Mutex<ZenohKeyState>>,
-) -> Result<(), io::Error> {
-    let new_state = {
-        let mut state = local_key_state.lock().unwrap();
-        let next_state = match *state {
-            ZenohKeyState::Generated => ZenohKeyState::Syncing,
-            ZenohKeyState::Syncing => ZenohKeyState::InUse,
-            ZenohKeyState::InUse => ZenohKeyState::DeletedOrUsed,
-            ZenohKeyState::DeletedOrUsed => ZenohKeyState::Generated,
-        };
-        *state = next_state;
-        next_state
-    };
-
-    let state_update = ZenohRaftStateUpdate {
-        request_id,
-        key_id: String::from(PLACEHOLDER_KEY_ID),
-        state: new_state,
-        committed: true,
-    };
-    publish_json(session, remote_topics.raft_state_update.as_str(), &state_update, "Zenoh raft state update").await
 }
 
 async fn publish_json<T>(session: &zenoh::Session, topic: &str, payload: &T, label: &str) -> Result<(), io::Error>
