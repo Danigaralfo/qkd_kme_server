@@ -151,6 +151,22 @@ pub struct ZenohRaftStateUpdate {
     pub committed: bool,
 }
 
+/// Follower acknowledgement of a replicated [`ZenohRaftTransitionRequest`], sent back to the leader.
+///
+/// This flows in the opposite direction of [`ZenohRaftTransitionDecision`]
+/// (follower -> leader instead of leader -> requester) and only conveys
+/// whether the follower locally validated and accepted the replicated entry;
+/// it is not itself the leader's final decision to the original requester.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub struct ZenohRaftReplicateAck {
+    /// Request identifier of the transition being acknowledged. UUIDv4 format.
+    pub request_id: String,
+    /// Node-id of the follower issuing this acknowledgement.
+    pub follower_kme: String,
+    /// Whether the follower locally validated and accepted the replicated transition.
+    pub accepted: bool,
+}
+
 /// External key material transported on the ETSI-020 Zenoh plane.
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 pub struct ZenohEtsiKeyMaterial {
@@ -277,6 +293,11 @@ impl ZenohTopicMap {
         format!("kme/{node_id}/raft/state/update")
     }
 
+    /// Build the topic where followers acknowledge a replicated transition back to the leader.
+    pub fn raft_replicate_ack_topic(leader_node_id: &str) -> String {
+        format!("kme/{leader_node_id}/raft/state_transition/ack")
+    }
+
     /// Build the topic used to report protocol-level errors for a node,
     /// shared by both the Raft and ETSI-020 planes.
     pub fn error_topic(node_id: &str) -> String {
@@ -286,7 +307,7 @@ impl ZenohTopicMap {
 
 #[cfg(test)]
 mod tests {
-    use super::{ZenohErrorCode, ZenohErrorResponse, ZenohEtsiExtKeysRequest, ZenohEtsiVersionQuery, ZenohEtsiVersionResponse, ZenohPlane, ZenohTopicMap, ZENOH_CONTRACT_VERSION};
+    use super::{ZenohErrorCode, ZenohErrorResponse, ZenohEtsiExtKeysRequest, ZenohEtsiVersionQuery, ZenohEtsiVersionResponse, ZenohPlane, ZenohRaftReplicateAck, ZenohTopicMap, ZENOH_CONTRACT_VERSION};
 
     #[test]
     fn topic_map_follows_specification() {
@@ -295,6 +316,21 @@ mod tests {
         assert_eq!(ZenohTopicMap::ext_keys_topic("kme-b"), "kme-b/kmapi/ext_keys");
         assert_eq!(ZenohTopicMap::ext_keys_ack_topic("kme-a"), "kme-a/kmapi/ext_keys/ack");
         assert_eq!(ZenohTopicMap::ext_keys_void_topic("kme-b"), "kme-b/kmapi/ext_keys/void");
+        assert_eq!(ZenohTopicMap::raft_replicate_ack_topic("kme-a"), "kme/kme-a/raft/state_transition/ack");
+    }
+
+    #[test]
+    fn raft_replicate_ack_serializes_follower_and_request_id() {
+        let ack = ZenohRaftReplicateAck {
+            request_id: String::from("req-4"),
+            follower_kme: String::from("kme-b"),
+            accepted: true,
+        };
+
+        let json = serde_json::to_string(&ack).unwrap();
+        assert!(json.contains("req-4"));
+        assert!(json.contains("kme-b"));
+        assert!(json.contains("true"));
     }
 
     #[test]

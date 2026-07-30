@@ -31,6 +31,10 @@ pub struct ZenohTransportConfig {
     /// controls the temporary probe, not real message routing.
     #[serde(default)]
     pub probe_role: ZenohProbeRole,
+    /// Raft cluster configuration used to replicate key-state transitions
+    /// (Phase 4). See [`RaftConfig`] for details and current limitations.
+    #[serde(default)]
+    pub raft: RaftConfig,
 }
 
 impl Default for ZenohTransportConfig {
@@ -43,8 +47,29 @@ impl Default for ZenohTransportConfig {
             role: ZenohNodeRole::Peer,
             probe_remote_node_id: None,
             probe_role: ZenohProbeRole::Responder,
+            raft: RaftConfig::default(),
         }
     }
+}
+
+/// Raft cluster configuration for key-state transition consensus (Phase 4).
+///
+/// Leader election is not implemented yet: `leader_id` is a static,
+/// operator-configured leader shared by every node's configuration file.
+/// This will be replaced by a real election protocol (`RequestVote`/terms)
+/// in a later increment; until then, if the configured leader is
+/// unreachable the cluster simply cannot commit new transitions.
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+pub struct RaftConfig {
+    /// Node-ids of every member participating in the Raft cluster, including this node.
+    #[serde(default)]
+    pub cluster_members: Vec<String>,
+    /// Node-id of the statically configured leader.
+    ///
+    /// Must be one of `cluster_members`. `None` means this node does not
+    /// participate in Raft consensus.
+    #[serde(default)]
+    pub leader_id: Option<String>,
 }
 
 /// Role played by a node in the temporary contract probe.

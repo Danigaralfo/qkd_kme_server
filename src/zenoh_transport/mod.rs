@@ -8,6 +8,7 @@ pub mod config;
 pub mod contract;
 pub mod messages;
 mod probe;
+pub mod raft;
 pub mod runtime;
 
 pub use runtime::ZenohTransport;

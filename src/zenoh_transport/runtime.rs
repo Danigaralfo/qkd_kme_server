@@ -3,10 +3,10 @@
 //! This module only covers real node bootstrap: opening the Zenoh session,
 //! serving this node's own version over the Storage/Query pattern, and
 //! subscribing to this node's own contract topics. The temporary
-//! validation probe (simulated peer publications and placeholder key-state
-//! reflection) lives in `probe.rs`, so it can be discarded on its own once
-//! real business-logic-driven wiring (via `QkdManager` and, eventually,
-//! Raft) replaces it.
+//! validation probe (simulated ETSI-020 peer publications) lives in
+//! `probe.rs`, and the real Raft-lite consensus for key-state transitions
+//! (Phase 4) lives in `raft.rs`, so each can evolve (or be discarded)
+//! independently of this bootstrap code.
 
 use crate::io_err;
 use log::{error, info};
@@ -16,6 +16,7 @@ use uuid::Uuid;
 use super::contract::{ZenohEtsiVersionResponse, ZenohTopicMap, ZENOH_CONTRACT_VERSION};
 use super::messages::ZenohEnvelope;
 use super::probe;
+use super::raft;
 use super::config::ZenohTransportConfig;
 
 /// Entry point for the Zenoh transport runtime.
@@ -73,7 +74,8 @@ impl ZenohTransport {
     /// Initialize this Zenoh node: open the session, serve this node's own
     /// version over the Storage/Query pattern, subscribe to its own
     /// remaining contract topics, and hand off the session to the temporary
-    /// validation probe (see `probe.rs`) before waiting for shutdown.
+    /// ETSI-020 validation probe (see `probe.rs`) and the real Raft-lite
+    /// consensus protocol (see `raft.rs`) before waiting for shutdown.
     async fn run(&self) -> Result<(), io::Error> {
         let session_config = self.build_session_config()?;
         let session = zenoh::open(session_config)
@@ -83,6 +85,7 @@ impl ZenohTransport {
         self.spawn_own_version_queryable(&session).await?;
         self.spawn_own_subscribers(&session).await?;
         probe::spawn(&self.config, &session).await?;
+        raft::spawn(&self.config, &session).await?;
 
         info!(
             "Zenoh transport started for node '{}' on contract topics",
@@ -153,13 +156,13 @@ impl ZenohTransport {
             }};
         }
 
-        spawn_logger!("ext_keys", ZenohTopicMap::ext_keys_topic(node_id));
-        spawn_logger!("ext_keys_ack", ZenohTopicMap::ext_keys_ack_topic(node_id));
-        spawn_logger!("ext_keys_void", ZenohTopicMap::ext_keys_void_topic(node_id));
+        // `ext_keys`/`ext_keys_ack`/`ext_keys_void` are handled with real logic
+        // (receipt + ack, void processing) by `probe.rs`, not just logged here.
         spawn_logger!("raft_presence", ZenohTopicMap::raft_presence_topic(node_id));
-        spawn_logger!("raft_transition_request", ZenohTopicMap::raft_transition_request_topic(node_id));
+        // Only logged here, not handled by `raft.rs`: this is the leader's reply to a
+        // client proposal made from this node (see `raft::propose_transition`), not a
+        // message the Raft protocol itself needs to react to.
         spawn_logger!("raft_transition_decision", ZenohTopicMap::raft_transition_decision_topic(node_id));
-        spawn_logger!("raft_state_update", ZenohTopicMap::raft_state_update_topic(node_id));
 
         Ok(())
     }
