@@ -31,11 +31,20 @@
 //!   requester); this is not a persistent "down" membership tracked across
 //!   proposals, so a slow/unresponsive follower is retried again on its own
 //!   merits for every subsequent proposal.
+//!
+//! Phase 5 adds [`KeyStates`] (a shared, continuously-updated view of the
+//! last Raft-committed state per key-id, fed by both the leader's commit
+//! path and the follower's state-update subscriber) and
+//! [`KeyLifecycleAuthorizer`]/[`RaftKeyCoordinator`], the interface business
+//! logic (`key_handler.rs`) uses to consult this module before accepting a
+//! sensitive key-state transition.
 
 use crate::io_err;
 use log::{error, info};
 use std::collections::{HashMap, HashSet};
+use std::future::Future;
 use std::io;
+use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use uuid::Uuid;
@@ -54,6 +63,10 @@ const RAFT_ACK_TIMEOUT: Duration = Duration::from_secs(10);
 /// followers that have not acked it yet, so a dropped message or a follower
 /// that starts late does not stall the proposal until [`RAFT_ACK_TIMEOUT`].
 const RAFT_RETRY_INTERVAL: Duration = Duration::from_secs(2);
+
+/// How long [`RaftKeyCoordinator::authorize_transition`] waits for the
+/// cluster's decision before giving up.
+const KEY_LIFECYCLE_AUTHORIZATION_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Role this node plays in the Raft-lite protocol, derived from
 /// [`super::config::RaftConfig::leader_id`].
@@ -279,20 +292,130 @@ impl LeaderState {
 /// In-memory, per-key committed state kept by a follower.
 type KeyStateStore = Arc<Mutex<HashMap<String, ZenohKeyState>>>;
 
+/// Shared, continuously-updated view of the last Raft-committed state for
+/// each key-id, readable by business logic outside this module.
+///
+/// Fed by this node's own Raft role: on the leader by
+/// [`spawn_leader_ack_subscriber`]'s commit path, on a follower by
+/// [`spawn_follower_state_update_subscriber`]'s applied updates. A key with
+/// no entry has not had any transition committed yet (implicitly `Generated`).
+#[derive(Clone, Default)]
+pub struct KeyStates(KeyStateStore);
+
+impl KeyStates {
+    /// A fresh, empty view (no key has a committed state yet).
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Last Raft-committed state for `key_id`, or `None` if nothing has been
+    /// committed for it yet.
+    pub fn get(&self, key_id: &str) -> Option<ZenohKeyState> {
+        self.0.lock().unwrap().get(key_id).copied()
+    }
+
+    /// Record the last Raft-committed state for `key_id`.
+    fn set(&self, key_id: &str, state: ZenohKeyState) {
+        self.0.lock().unwrap().insert(key_id.to_string(), state);
+    }
+}
+
+/// Authorizes QKD key-state transitions against Raft consensus before
+/// business logic (`key_handler.rs`) commits them locally.
+///
+/// Implemented by [`RaftKeyCoordinator`] for real deployments; test code can
+/// provide a fake implementation instead of standing up a real Zenoh session.
+pub trait KeyLifecycleAuthorizer: Send + Sync {
+    /// Ask the Raft leader to authorize moving `key_id` to `requested_state`,
+    /// addressed to `slave_kme` as the peer that will receive the key.
+    /// Updates the coordinator's own view of `key_id`'s state on success.
+    fn authorize_transition<'a>(
+        &'a self,
+        key_id: &'a str,
+        slave_kme: &'a str,
+        requested_state: ZenohKeyState,
+    ) -> Pin<Box<dyn Future<Output = Result<(), io::Error>> + Send + 'a>>;
+
+    /// Last Raft-committed state for `key_id`, or `None` if nothing has been
+    /// committed for it yet. A read-only check, unlike `authorize_transition`,
+    /// for callers that only need to verify a state another node already
+    /// committed (e.g. the slave side of a cross-KME activation).
+    fn current_state(&self, key_id: &str) -> Option<ZenohKeyState>;
+}
+
+/// Bridges QKD business logic to this module's Raft-lite consensus: the
+/// concrete, Zenoh-backed [`KeyLifecycleAuthorizer`].
+#[derive(Clone)]
+pub struct RaftKeyCoordinator {
+    config: ZenohTransportConfig,
+    session: zenoh::Session,
+    key_states: KeyStates,
+}
+
+impl RaftKeyCoordinator {
+    /// Build a coordinator over an already-running Raft node.
+    /// # Arguments
+    /// * `config` - This node's Zenoh transport configuration (used to reach the configured leader).
+    /// * `session` - The already-open Zenoh session shared with the rest of the transport.
+    /// * `key_states` - The shared committed-state view returned by [`spawn`].
+    pub fn new(config: ZenohTransportConfig, session: zenoh::Session, key_states: KeyStates) -> Self {
+        Self { config, session, key_states }
+    }
+}
+
+impl KeyLifecycleAuthorizer for RaftKeyCoordinator {
+    fn authorize_transition<'a>(
+        &'a self,
+        key_id: &'a str,
+        slave_kme: &'a str,
+        requested_state: ZenohKeyState,
+    ) -> Pin<Box<dyn Future<Output = Result<(), io::Error>> + Send + 'a>> {
+        Box::pin(async move {
+            let current_state = self.key_states.get(key_id).unwrap_or(ZenohKeyState::Generated);
+            // Fast local rejection: never even ask the leader to reuse a terminated key-id.
+            if current_state == ZenohKeyState::DeletedOrUsed {
+                return Err(io_err(&format!("Key '{key_id}' is already deleted/used; it cannot be transitioned again")));
+            }
+            let decision = propose_transition_and_await_decision(
+                &self.config,
+                &self.session,
+                key_id,
+                slave_kme,
+                current_state,
+                requested_state,
+                KEY_LIFECYCLE_AUTHORIZATION_TIMEOUT,
+            )
+            .await?;
+            if !decision.accepted {
+                return Err(io_err(&format!("Raft cluster rejected transition of key '{key_id}' to {requested_state:?}: {:?}", decision.reason)));
+            }
+            self.key_states.set(key_id, requested_state);
+            Ok(())
+        })
+    }
+
+    fn current_state(&self, key_id: &str) -> Option<ZenohKeyState> {
+        self.key_states.get(key_id)
+    }
+}
+
 /// Start the Raft-lite protocol on top of an already-initialized Zenoh
 /// session, dispatching to the leader or follower behavior based on
-/// `config.raft.leader_id`.
-pub(super) async fn spawn(config: &ZenohTransportConfig, session: &zenoh::Session) -> Result<(), io::Error> {
+/// `config.raft.leader_id`. Returns a [`KeyStates`] view that is kept
+/// up to date with every commit this node observes (as leader or follower),
+/// for business logic to consult via [`RaftKeyCoordinator`].
+pub(super) async fn spawn(config: &ZenohTransportConfig, session: &zenoh::Session) -> Result<KeyStates, io::Error> {
     match role_for(config) {
         RaftRole::Leader => spawn_leader(config, session).await,
         RaftRole::Follower => spawn_follower(config, session).await,
     }
 }
 
-async fn spawn_leader(config: &ZenohTransportConfig, session: &zenoh::Session) -> Result<(), io::Error> {
+async fn spawn_leader(config: &ZenohTransportConfig, session: &zenoh::Session) -> Result<KeyStates, io::Error> {
     let node_id = config.node_id.clone();
     let followers: Vec<String> = config.raft.cluster_members.iter().filter(|member| *member != &node_id).cloned().collect();
     let state = Arc::new(Mutex::new(LeaderState::new(config.raft.cluster_members.clone())));
+    let key_states = KeyStates::new();
 
     info!(
         "Zenoh Raft: node '{}' starting as leader over cluster {:?} (quorum {})",
@@ -302,26 +425,26 @@ async fn spawn_leader(config: &ZenohTransportConfig, session: &zenoh::Session) -
     );
 
     spawn_leader_request_subscriber(node_id.clone(), session.clone(), followers.clone(), state.clone()).await?;
-    spawn_leader_ack_subscriber(node_id.clone(), session.clone(), followers.clone(), state.clone()).await?;
+    spawn_leader_ack_subscriber(node_id.clone(), session.clone(), followers.clone(), state.clone(), key_states.clone()).await?;
     spawn_leader_retry_and_timeout_task(node_id, session.clone(), followers, state);
-    Ok(())
+    Ok(key_states)
 }
 
-async fn spawn_follower(config: &ZenohTransportConfig, session: &zenoh::Session) -> Result<(), io::Error> {
+async fn spawn_follower(config: &ZenohTransportConfig, session: &zenoh::Session) -> Result<KeyStates, io::Error> {
     let node_id = config.node_id.clone();
     let leader_id = match config.raft.leader_id.clone() {
         Some(leader_id) => leader_id,
         None => {
             error!("Zenoh Raft: node '{}' has no configured raft.leader_id; cannot start as a follower", node_id);
-            return Ok(());
+            return Ok(KeyStates::new());
         }
     };
     info!("Zenoh Raft: node '{}' starting as follower of leader '{}'", node_id, leader_id);
 
-    let local_states: KeyStateStore = Arc::new(Mutex::new(HashMap::new()));
-    spawn_follower_request_subscriber(node_id.clone(), session.clone(), leader_id, local_states.clone()).await?;
-    spawn_follower_state_update_subscriber(node_id, session.clone(), local_states).await?;
-    Ok(())
+    let key_states = KeyStates::new();
+    spawn_follower_request_subscriber(node_id.clone(), session.clone(), leader_id, key_states.clone()).await?;
+    spawn_follower_state_update_subscriber(node_id, session.clone(), key_states.clone()).await?;
+    Ok(key_states)
 }
 
 /// Leader-side background task: periodically gives up on proposals that
@@ -450,6 +573,7 @@ async fn spawn_leader_ack_subscriber(
     session: zenoh::Session,
     followers: Vec<String>,
     state: Arc<Mutex<LeaderState>>,
+    key_states: KeyStates,
 ) -> Result<(), io::Error> {
     let topic = ZenohTopicMap::raft_replicate_ack_topic(node_id.as_str());
     let subscriber = session
@@ -477,6 +601,7 @@ async fn spawn_leader_ack_subscriber(
                                 "Zenoh Raft leader '{}': committed proposal '{}' for key '{}' -> {:?}",
                                 node_id, commit.request_id, commit.key_id, commit.state
                             );
+                            key_states.set(commit.key_id.as_str(), commit.state);
                             let state_update = ZenohRaftStateUpdate {
                                 request_id: commit.request_id.clone(),
                                 key_id: commit.key_id.clone(),
@@ -519,7 +644,7 @@ async fn spawn_follower_request_subscriber(
     node_id: String,
     session: zenoh::Session,
     leader_id: String,
-    local_states: KeyStateStore,
+    local_states: KeyStates,
 ) -> Result<(), io::Error> {
     let topic = ZenohTopicMap::raft_transition_request_topic(node_id.as_str());
     let subscriber = session
@@ -532,10 +657,7 @@ async fn spawn_follower_request_subscriber(
             match sample.payload().try_to_string() {
                 Ok(payload) => match serde_json::from_str::<ZenohRaftTransitionRequest>(&payload) {
                     Ok(request) => {
-                        let current = {
-                            let states = local_states.lock().unwrap();
-                            states.get(request.key_id.as_str()).copied().unwrap_or(ZenohKeyState::Generated)
-                        };
+                        let current = local_states.get(request.key_id.as_str()).unwrap_or(ZenohKeyState::Generated);
                         let accepted = current == request.current_state && is_valid_transition(current, request.requested_state);
                         if !accepted {
                             error!(
@@ -571,7 +693,7 @@ async fn spawn_follower_request_subscriber(
 async fn spawn_follower_state_update_subscriber(
     node_id: String,
     session: zenoh::Session,
-    local_states: KeyStateStore,
+    local_states: KeyStates,
 ) -> Result<(), io::Error> {
     let topic = ZenohTopicMap::raft_state_update_topic(node_id.as_str());
     let subscriber = session
@@ -585,7 +707,7 @@ async fn spawn_follower_state_update_subscriber(
                 Ok(payload) => match serde_json::from_str::<ZenohRaftStateUpdate>(&payload) {
                     Ok(update) => {
                         if update.committed {
-                            local_states.lock().unwrap().insert(update.key_id.clone(), update.state);
+                            local_states.set(update.key_id.as_str(), update.state);
                             info!(
                                 "Zenoh Raft follower '{}': applied committed transition '{}' for key '{}' -> {:?}",
                                 node_id, update.request_id, update.key_id, update.state
@@ -894,5 +1016,29 @@ mod tests {
         assert_eq!(retried_request.request_id, request.request_id);
         missing.sort();
         assert_eq!(missing, vec![String::from("kme-3"), String::from("kme-4")]);
+    }
+
+    #[test]
+    fn key_states_has_no_entry_for_a_key_never_set() {
+        let key_states = KeyStates::new();
+        assert_eq!(key_states.get("key-1"), None);
+    }
+
+    #[test]
+    fn key_states_get_returns_the_last_set_value() {
+        let key_states = KeyStates::new();
+        key_states.set("key-1", ZenohKeyState::Syncing);
+        assert_eq!(key_states.get("key-1"), Some(ZenohKeyState::Syncing));
+        key_states.set("key-1", ZenohKeyState::InUse);
+        assert_eq!(key_states.get("key-1"), Some(ZenohKeyState::InUse));
+        assert_eq!(key_states.get("key-2"), None);
+    }
+
+    #[test]
+    fn key_states_clones_share_the_same_underlying_state() {
+        let key_states = KeyStates::new();
+        let cloned = key_states.clone();
+        key_states.set("key-1", ZenohKeyState::Generated);
+        assert_eq!(cloned.get("key-1"), Some(ZenohKeyState::Generated));
     }
 }

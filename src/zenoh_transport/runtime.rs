@@ -2,20 +2,20 @@
 //!
 //! This module only covers real node bootstrap: opening the Zenoh session,
 //! serving this node's own version over the Storage/Query pattern, and
-//! subscribing to this node's own contract topics. The temporary
-//! validation probe (simulated ETSI-020 peer publications) lives in
-//! `probe.rs`, and the real Raft-lite consensus for key-state transitions
-//! (Phase 4) lives in `raft.rs`, so each can evolve (or be discarded)
-//! independently of this bootstrap code.
+//! subscribing to this node's own contract topics. The real Raft-lite
+//! consensus for key-state transitions (Phase 4) lives in `raft.rs`, so it
+//! can evolve independently of this bootstrap code.
 
 use crate::io_err;
+use crate::qkd_manager::QkdManager;
 use log::{error, info};
 use std::io;
+use std::sync::Arc;
 use uuid::Uuid;
 
 use super::contract::{ZenohEtsiVersionResponse, ZenohTopicMap, ZENOH_CONTRACT_VERSION};
+use super::inter_kme_transport::{self, ZenohInterKmeTransport};
 use super::messages::ZenohEnvelope;
-use super::probe;
 use super::raft;
 use super::config::ZenohTransportConfig;
 
@@ -32,15 +32,17 @@ impl ZenohTransport {
     }
 
     /// Start the transport layer: open the Zenoh session, serve this node's
-    /// own version and subscribe to its own contract topics.
-    pub async fn start(config: ZenohTransportConfig) -> Result<(), io::Error> {
+    /// own version and subscribe to its own contract topics. `qkd_manager` is given a
+    /// [`ZenohInterKmeTransport`] (installed via `set_inter_kme_transport`) and is used to
+    /// service incoming key activation requests from other KMEs (see [`inter_kme_transport`]).
+    pub async fn start(config: ZenohTransportConfig, qkd_manager: QkdManager) -> Result<(), io::Error> {
         let transport = Self::new(config);
         info!(
             "Starting Zenoh transport for node '{}' with role {:?}",
             transport.config.node_id,
             transport.config.role
         );
-        transport.run().await
+        transport.run(qkd_manager).await
     }
 
     fn build_session_config(&self) -> Result<zenoh::Config, io::Error> {
@@ -73,10 +75,9 @@ impl ZenohTransport {
 
     /// Initialize this Zenoh node: open the session, serve this node's own
     /// version over the Storage/Query pattern, subscribe to its own
-    /// remaining contract topics, and hand off the session to the temporary
-    /// ETSI-020 validation probe (see `probe.rs`) and the real Raft-lite
-    /// consensus protocol (see `raft.rs`) before waiting for shutdown.
-    async fn run(&self) -> Result<(), io::Error> {
+    /// remaining contract topics, and hand off the session to the real
+    /// Raft-lite consensus protocol (see `raft.rs`) before waiting for shutdown.
+    async fn run(&self, qkd_manager: QkdManager) -> Result<(), io::Error> {
         let session_config = self.build_session_config()?;
         let session = zenoh::open(session_config)
             .await
@@ -84,8 +85,16 @@ impl ZenohTransport {
 
         self.spawn_own_version_queryable(&session).await?;
         self.spawn_own_subscribers(&session).await?;
-        probe::spawn(&self.config, &session).await?;
-        raft::spawn(&self.config, &session).await?;
+        let key_states = raft::spawn(&self.config, &session).await?;
+
+        // Real (non-demo) inter-KME wiring: service incoming activation requests, and make
+        // outgoing ones (from qkd_manager's business logic) go out over Zenoh instead of
+        // classical HTTPS.
+        inter_kme_transport::spawn_activate_key_responder(self.config.node_id.clone(), session.clone(), qkd_manager.clone()).await?;
+        qkd_manager.set_inter_kme_transport(Arc::new(ZenohInterKmeTransport::new(self.config.clone(), session.clone()))).await;
+        // Gate real cross-KME key-state transitions on this same Raft cluster, so the state
+        // machine built in Phase 5 is actually enforced for real SAE traffic.
+        qkd_manager.set_raft_authorizer(Arc::new(raft::RaftKeyCoordinator::new(self.config.clone(), session.clone(), key_states))).await;
 
         info!(
             "Zenoh transport started for node '{}' on contract topics",
@@ -156,9 +165,6 @@ impl ZenohTransport {
             }};
         }
 
-        // `ext_keys`/`ext_keys_ack`/`ext_keys_void` are handled with real logic
-        // (receipt + ack, void processing) by `probe.rs`, not just logged here.
-        spawn_logger!("raft_presence", ZenohTopicMap::raft_presence_topic(node_id));
         // Only logged here, not handled by `raft.rs`: this is the leader's reply to a
         // client proposal made from this node (see `raft::propose_transition`), not a
         // message the Raft protocol itself needs to react to.

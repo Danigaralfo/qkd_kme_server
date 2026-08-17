@@ -31,6 +31,15 @@ impl Config {
         };
         Ok(config)
     }
+
+    /// Build a `KmeId -> Zenoh node_id` lookup table from `other_kmes[].zenoh_node_id`, used to
+    /// address point-to-point Zenoh topics (e.g. the inter-KME `/kmapi/activate` transport) at the
+    /// right peer when `transport_mode: zenoh_raft`. KMEs with no `zenoh_node_id` set are omitted.
+    pub fn other_kme_zenoh_node_ids(&self) -> std::collections::HashMap<KmeId, String> {
+        self.other_kme_configs.iter()
+            .filter_map(|other_kme| other_kme.zenoh_node_id.clone().map(|node_id| (other_kme.id, node_id)))
+            .collect()
+    }
 }
 
 /// Config for this specific KME, including its ID and paths to certificates
@@ -122,7 +131,12 @@ pub struct OtherKmeConfig {
     /// Client certificate for inter KME HTTPS authentication
     pub(crate) https_client_authentication_certificate: String,
     /// Password for the client certificate
-    pub(crate) https_client_authentication_certificate_password: String
+    pub(crate) https_client_authentication_certificate_password: String,
+    /// Zenoh `node_id` hostname of the other KME, used to address it directly over Zenoh
+    /// (e.g. the `/kmapi/activate` inter-KME transport) when `transport_mode: zenoh_raft`.
+    /// Only required in that mode; ignored otherwise.
+    #[serde(default)]
+    pub(crate) zenoh_node_id: Option<String>
 }
 
 /// Config for specific SAE: its ID, KME ID and optional client certificate serial

@@ -63,7 +63,9 @@ impl<T: crate::routes::Routes> AuthHttpsServer<T> {
     /// # Returns
     /// A new AuthHttpsServer
     pub fn new(listen_addr: &str, ca_client_cert_path: &str, server_cert_path: &str, server_key_path: &str) -> AuthHttpsServer<T> {
-        #[cfg(target_os = "macos")]
+        // Other dependencies (e.g. zenoh) may also link rustls with a different crypto backend
+        // (aws-lc-rs), so the default provider can't be auto-detected: pick one explicitly here,
+        // on every platform, not just macOS.
         let _ = rustls::crypto::ring::default_provider().install_default();
         AuthHttpsServer {
             phantom: PhantomData,

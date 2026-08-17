@@ -7,8 +7,10 @@
 pub mod config;
 pub mod contract;
 pub mod messages;
-mod probe;
 pub mod raft;
+/// Real (non-demo) inter-KME transport over Zenoh, replacing the classical HTTPS
+/// `/keys/activate` call when `transport_mode: ZenohRaft` is configured.
+pub mod inter_kme_transport;
 pub mod runtime;
 
 pub use runtime::ZenohTransport;

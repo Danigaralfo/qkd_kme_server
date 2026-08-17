@@ -8,6 +8,7 @@
 //! for protocol-level failures.
 
 use serde::{Deserialize, Serialize};
+use crate::SaeId;
 
 /// Contract version used by all Zenoh payloads defined in this module.
 pub const ZENOH_CONTRACT_VERSION: &str = "1.0";
@@ -244,6 +245,37 @@ pub struct ZenohEtsiExtKeysVoid {
     pub reason: String,
 }
 
+/// Request to activate a set of already QKD-synchronized key-ids on a remote (slave) KME for a
+/// given SAE pair. This is the Zenoh-transported equivalent of the classical `/keys/activate`
+/// inter-KME route (see `qkd_manager::inter_kme_transport`); it deliberately carries no key
+/// material, since both KMEs already share raw QKD key material out of band.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub struct ZenohActivateKeyRequest {
+    /// Unique request identifier. UUIDv4 format.
+    pub request_id: String,
+    /// Master KME that originated the activation request.
+    pub master_kme: String,
+    /// Slave KME asked to activate the keys locally.
+    pub slave_kme: String,
+    /// The origin (master) SAE ID.
+    pub origin_sae_id: SaeId,
+    /// The target (slave) SAE ID.
+    pub target_sae_id: SaeId,
+    /// The key-ids to activate.
+    pub key_ids: Vec<String>,
+}
+
+/// Acknowledgement for a [`ZenohActivateKeyRequest`], reporting whether the slave KME accepted it.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub struct ZenohActivateKeyAck {
+    /// Unique request identifier, matching the original [`ZenohActivateKeyRequest`].
+    pub request_id: String,
+    /// Whether the slave KME accepted and applied the activation request.
+    pub accepted: bool,
+    /// Human-readable rejection reason, present when `accepted` is `false`.
+    pub reason: Option<String>,
+}
+
 /// Zenoh topic builders aligned with the specification.
 pub struct ZenohTopicMap;
 
@@ -271,6 +303,17 @@ impl ZenohTopicMap {
     /// Build the void topic for `/kmapi/v1/ext_keys/void`.
     pub fn ext_keys_void_topic(slave_node_hostname: &str) -> String {
         format!("{slave_node_hostname}/kmapi/ext_keys/void")
+    }
+
+    /// Build the pub/sub topic for key activation requests, the Zenoh equivalent of the
+    /// classical `/keys/activate` inter-KME route.
+    pub fn activate_key_topic(slave_node_hostname: &str) -> String {
+        format!("{slave_node_hostname}/kmapi/activate")
+    }
+
+    /// Build the acknowledgement topic for key activation requests.
+    pub fn activate_key_ack_topic(master_node_hostname: &str) -> String {
+        format!("{master_node_hostname}/kmapi/activate/ack")
     }
 
     /// Build a topic for Raft presence announcements.
@@ -307,7 +350,7 @@ impl ZenohTopicMap {
 
 #[cfg(test)]
 mod tests {
-    use super::{ZenohErrorCode, ZenohErrorResponse, ZenohEtsiExtKeysRequest, ZenohEtsiVersionQuery, ZenohEtsiVersionResponse, ZenohPlane, ZenohRaftReplicateAck, ZenohTopicMap, ZENOH_CONTRACT_VERSION};
+    use super::{ZenohActivateKeyAck, ZenohActivateKeyRequest, ZenohErrorCode, ZenohErrorResponse, ZenohEtsiExtKeysRequest, ZenohEtsiVersionQuery, ZenohEtsiVersionResponse, ZenohPlane, ZenohRaftReplicateAck, ZenohTopicMap, ZENOH_CONTRACT_VERSION};
 
     #[test]
     fn topic_map_follows_specification() {
@@ -316,7 +359,40 @@ mod tests {
         assert_eq!(ZenohTopicMap::ext_keys_topic("kme-b"), "kme-b/kmapi/ext_keys");
         assert_eq!(ZenohTopicMap::ext_keys_ack_topic("kme-a"), "kme-a/kmapi/ext_keys/ack");
         assert_eq!(ZenohTopicMap::ext_keys_void_topic("kme-b"), "kme-b/kmapi/ext_keys/void");
+        assert_eq!(ZenohTopicMap::activate_key_topic("kme-b"), "kme-b/kmapi/activate");
+        assert_eq!(ZenohTopicMap::activate_key_ack_topic("kme-a"), "kme-a/kmapi/activate/ack");
         assert_eq!(ZenohTopicMap::raft_replicate_ack_topic("kme-a"), "kme/kme-a/raft/state_transition/ack");
+    }
+
+    #[test]
+    fn activate_key_request_and_ack_serialize_expected_fields() {
+        let request = ZenohActivateKeyRequest {
+            request_id: String::from("req-activate-1"),
+            master_kme: String::from("kme-a"),
+            slave_kme: String::from("kme-b"),
+            origin_sae_id: 1,
+            target_sae_id: 2,
+            key_ids: vec![String::from("key-1")],
+        };
+        let accepted_ack = ZenohActivateKeyAck {
+            request_id: String::from("req-activate-1"),
+            accepted: true,
+            reason: None,
+        };
+        let rejected_ack = ZenohActivateKeyAck {
+            request_id: String::from("req-activate-1"),
+            accepted: false,
+            reason: Some(String::from("not in Syncing state")),
+        };
+
+        let request_json = serde_json::to_string(&request).unwrap();
+        assert!(request_json.contains("req-activate-1"));
+        assert!(request_json.contains("key-1"));
+
+        let accepted_json = serde_json::to_string(&accepted_ack).unwrap();
+        assert!(accepted_json.contains("\"accepted\":true"));
+        let rejected_json = serde_json::to_string(&rejected_ack).unwrap();
+        assert!(rejected_json.contains("not in Syncing state"));
     }
 
     #[test]

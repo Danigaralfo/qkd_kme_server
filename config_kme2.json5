@@ -10,8 +10,6 @@
       "listen_endpoint": "tcp/127.0.0.1:7448",
       "peers": ["tcp/127.0.0.1:7447"],
       "role": "peer",
-      "probe_remote_node_id": "kme-1-zenoh", // Temporary contract probe: master node to query for its version
-      "probe_role": "responder", // Temporary contract probe: this node only subscribes/queries, never publishes
       "raft": {
         "cluster_members": ["kme-1-zenoh", "kme-2-zenoh"], // Node-ids participating in Raft consensus, including this node
         "leader_id": "kme-1-zenoh" // Statically configured Raft leader (no election yet)
@@ -37,7 +35,8 @@
       "inter_kme_bind_address": "localhost:13001", // Address of the other KME to connect to
       // "ignore_system_proxy_settings" not set: default to false
       "https_client_authentication_certificate": "certs/inter_kmes/kme2-to-kme1.pfx", // Client cert to authenticate to the other KME
-      "https_client_authentication_certificate_password": "password" // Password for the client cert (empty if none)
+      "https_client_authentication_certificate_password": "password", // Password for the client cert (empty if none)
+      "zenoh_node_id": "kme-1-zenoh" // Zenoh node_id of the other KME, used to address it directly when transport_mode is zenoh_raft
     }
   ],
   "saes": [

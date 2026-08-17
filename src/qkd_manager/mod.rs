@@ -5,6 +5,9 @@ pub(crate) mod http_response_obj;
 pub(crate) mod http_request_obj;
 mod router;
 mod config_extractor;
+/// Abstraction over how this KME reaches another KME to activate keys (classical HTTPS by
+/// default, or Zenoh+Raft - see [`crate::zenoh_transport::inter_kme_transport`]).
+pub mod inter_kme_transport;
 
 use crate::entropy::{EntropyAccumulator, ShannonEntropyAccumulator};
 use crate::event_subscription::ImportantEventSubscriber;
@@ -269,6 +272,25 @@ impl QkdManager {
     pub async fn add_important_event_subscriber(&self, subscriber: Arc<dyn ImportantEventSubscriber>) -> Result<(), io::Error> {
         self.key_handler.add_important_event_subscriber(subscriber).await
     }
+
+    /// Set (or replace) the Raft coordinator consulted before accepting sensitive cross-KME
+    /// key-state transitions. Optional and backward-compatible: as long as this is never called,
+    /// this QKD manager behaves exactly as it did before Phase 5 (no consensus gating at all).
+    /// # Arguments
+    /// * `authorizer` - The Raft-backed authorizer to consult from now on
+    pub async fn set_raft_authorizer(&self, authorizer: Arc<dyn crate::zenoh_transport::raft::KeyLifecycleAuthorizer>) {
+        self.key_handler.set_raft_authorizer(authorizer).await
+    }
+
+    /// Set (or replace) the transport used to activate keys on other KMEs. Optional to call:
+    /// as long as this is never invoked, this QKD manager keeps using the classical HTTPS
+    /// transport it is constructed with by default. Used to switch to the Zenoh+Raft transport
+    /// when `transport_mode: ZenohRaft` is configured (see `main.rs`).
+    /// # Arguments
+    /// * `transport` - The inter-KME transport to use from now on
+    pub async fn set_inter_kme_transport(&self, transport: Arc<dyn inter_kme_transport::InterKmeTransport>) {
+        self.key_handler.set_inter_kme_transport(transport).await
+    }
 }
 
 /// A Pre-init QKD key, with its origin and target KME IDs
@@ -368,6 +390,9 @@ pub enum QkdManagerResponse {
     SaeInfo(SAEInfo),
     /// The operation was successful, the requested KME information is returned (for example if GetKmeIdFromSaeId is called)
     KmeInfo(KMEInfo),
+    /// A Raft-gated cross-KME key-state transition was rejected by the cluster (e.g. the leader
+    /// or a peer did not authorize it, or the coordinator timed out waiting for a decision)
+    RaftConsensusRejected,
 }
 
 

@@ -81,9 +81,21 @@ async fn main() {
             }
         }
         TransportMode::ZenohRaft => {
-            let zenoh_config = config.this_kme_config.zenoh_transport.clone().unwrap_or_default();
-            if let Err(e) = ZenohTransport::start(zenoh_config).await {
-                error!("Error starting Zenoh transport skeleton: {}", e);
+            let mut zenoh_config = config.this_kme_config.zenoh_transport.clone().unwrap_or_default();
+            zenoh_config.other_kme_node_ids = config.other_kme_zenoh_node_ids();
+            // SAEs still reach their local KME over classical HTTPS (ETSI-014) regardless of the
+            // inter-KME transport, so it keeps running here; the classical inter-KME HTTPS server
+            // is not started in this mode, since Zenoh replaces that inbound channel (see
+            // `zenoh_transport::inter_kme_transport`).
+            select! {
+                x = sae_https_server.run(&qkd_manager) => {
+                    error!("Error running SAEs HTTPS server: {:?}", x);
+                },
+                x = ZenohTransport::start(zenoh_config, (*qkd_manager).clone()) => {
+                    if let Err(e) = x {
+                        error!("Error running Zenoh transport: {}", e);
+                    }
+                }
             }
         }
     }

@@ -1,6 +1,8 @@
 //! Configuration structures for the Zenoh transport skeleton.
 
+use std::collections::HashMap;
 use serde::{Deserialize, Serialize};
+use crate::KmeId;
 
 /// High-level configuration for the Zenoh transport layer.
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -17,24 +19,16 @@ pub struct ZenohTransportConfig {
     /// Node role in the Zenoh topology.
     #[serde(default)]
     pub role: ZenohNodeRole,
-    /// Hostname/node_id of a remote node used to run the contract probe.
-    ///
-    /// This field is a temporary testing aid to validate the contract defined in
-    /// [`crate::zenoh_transport::contract`] between two real processes. It is not
-    /// meant to survive once real ETSI/Raft business logic drives topic wiring
-    /// automatically from `other_kmes` and cluster membership.
-    #[serde(default)]
-    pub probe_remote_node_id: Option<String>,
-    /// Role played by this node in the contract probe.
-    ///
-    /// See [`ZenohTransportConfig::probe_remote_node_id`] for context: this only
-    /// controls the temporary probe, not real message routing.
-    #[serde(default)]
-    pub probe_role: ZenohProbeRole,
     /// Raft cluster configuration used to replicate key-state transitions
     /// (Phase 4). See [`RaftConfig`] for details and current limitations.
     #[serde(default)]
     pub raft: RaftConfig,
+    /// Maps each other KME's numeric [`KmeId`] to its Zenoh `node_id` hostname, so point-to-point
+    /// topics (e.g. the `/kmapi/activate` inter-KME transport) can address the right peer.
+    /// Not part of the JSON `zenoh_transport` block itself: built from `other_kmes[].zenoh_node_id`
+    /// (see [`crate::config::Config::other_kme_zenoh_node_ids`]) and filled in after deserialization.
+    #[serde(skip)]
+    pub other_kme_node_ids: HashMap<KmeId, String>,
 }
 
 impl Default for ZenohTransportConfig {
@@ -45,9 +39,8 @@ impl Default for ZenohTransportConfig {
             peers: Vec::new(),
             router_endpoint: None,
             role: ZenohNodeRole::Peer,
-            probe_remote_node_id: None,
-            probe_role: ZenohProbeRole::Responder,
             raft: RaftConfig::default(),
+            other_kme_node_ids: HashMap::new(),
         }
     }
 }
@@ -70,22 +63,6 @@ pub struct RaftConfig {
     /// participate in Raft consensus.
     #[serde(default)]
     pub leader_id: Option<String>,
-}
-
-/// Role played by a node in the temporary contract probe.
-#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub enum ZenohProbeRole {
-    /// This node publishes sample contract messages toward `probe_remote_node_id`.
-    Initiator,
-    /// This node only subscribes to its own topics and waits for messages.
-    Responder,
-}
-
-impl Default for ZenohProbeRole {
-    fn default() -> Self {
-        Self::Responder
-    }
 }
 
 /// Role of the node inside the Zenoh topology.

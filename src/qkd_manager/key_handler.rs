@@ -4,7 +4,10 @@ use crate::event_subscription::ImportantEventSubscriber;
 use crate::export_important_logging_message;
 use crate::prepare_sql_arguments;
 use crate::qkd_manager::http_response_obj::{ResponseQkdKey, ResponseQkdKeysList};
-use crate::qkd_manager::{http_request_obj, router, PreInitQkdKeyWrapper, QkdManagerResponse, SAEInfo};
+use crate::qkd_manager::inter_kme_transport::{HttpsInterKmeTransport, InterKmeTransport};
+use crate::qkd_manager::{router, PreInitQkdKeyWrapper, QkdManagerResponse, SAEInfo};
+use crate::zenoh_transport::contract::ZenohKeyState;
+use crate::zenoh_transport::raft::KeyLifecycleAuthorizer;
 use crate::{ensure_prepared_statement_ok, MEMORY_SQLITE_DB_PATH};
 use crate::{io_err, qkd_manager, KmeId, RequestedKeyCount, SaeClientCertSerial, SaeId};
 use base64::{engine::general_purpose, Engine as _};
@@ -58,8 +61,13 @@ pub(crate) struct KeyHandler {
     nickname: Option<String>,
     /// These key ids are currently being activated, you cannot activate them in a concurrent request
     blocked_key_ids: Arc<Mutex<HashSet<i64>>>,
-    /// Cache of connections to other KMEs, to avoid creating a new connection for each request
-    other_kme_connections_cache: Arc<RwLock<HashMap<KmeId, reqwest::Client>>>
+    /// Optional Raft coordinator consulted before accepting sensitive cross-KME key-state
+    /// transitions (see [`Self::set_raft_authorizer`]); `None` means no Raft cluster is
+    /// configured and transitions are accepted locally without consensus, as before Phase 5
+    raft_authorizer: Arc<RwLock<Option<Arc<dyn KeyLifecycleAuthorizer>>>>,
+    /// Transport used to activate keys on other KMEs (see [`Self::set_inter_kme_transport`]);
+    /// defaults to classical HTTPS, unchanged from before this abstraction existed
+    inter_kme_transport: Arc<RwLock<Arc<dyn InterKmeTransport>>>
 }
 
 impl KeyHandler {
@@ -107,15 +115,20 @@ impl KeyHandler {
                 io::Error::new(io::ErrorKind::NotConnected, format!("Error opening database: {:?}", e))
             })?;
 
+        let qkd_router = Arc::new(RwLock::new(router::QkdRouter::new()));
+        let other_kme_connections_cache = Arc::new(RwLock::new(HashMap::new()));
+        let inter_kme_transport: Arc<dyn InterKmeTransport> = Arc::new(HttpsInterKmeTransport::new(qkd_router.clone(), other_kme_connections_cache));
+
         let key_handler = Self {
             db: dbpool,
             dbms_type,
             this_kme_id,
-            qkd_router: Arc::new(RwLock::new(router::QkdRouter::new())),
+            qkd_router,
             event_notification_subscribers: Arc::new(RwLock::new(vec![])),
             nickname: kme_nickname,
             blocked_key_ids: Arc::new(Mutex::new(HashSet::with_capacity(8 * crate::MAX_QKD_KEYS_PER_REQUEST))),
-            other_kme_connections_cache: Arc::new(RwLock::new(HashMap::new()))
+            raft_authorizer: Arc::new(RwLock::new(None)),
+            inter_kme_transport: Arc::new(RwLock::new(inter_kme_transport))
         };
         // Create the tables if they do not exist
         key_handler.db.execute(database_initialization_req).await.map_err(|e| {
@@ -162,6 +175,25 @@ impl KeyHandler {
     pub(crate) async fn add_important_event_subscriber(&self, subscriber: Arc<dyn ImportantEventSubscriber>) -> Result<(), io::Error> {
         self.event_notification_subscribers.write().await.push(subscriber);
         Ok(())
+    }
+
+    /// Set (or replace) the Raft coordinator consulted before accepting sensitive cross-KME
+    /// key-state transitions (see `get_sae_keys` and `activate_key_uuids_sae`). Optional and
+    /// backward-compatible: as long as this is never called, this KME behaves exactly as it did
+    /// before Phase 5 (no consensus gating at all).
+    /// # Arguments
+    /// * `authorizer` - The Raft-backed authorizer to consult from now on
+    pub(crate) async fn set_raft_authorizer(&self, authorizer: Arc<dyn KeyLifecycleAuthorizer>) {
+        *self.raft_authorizer.write().await = Some(authorizer);
+    }
+
+    /// Set (or replace) the transport used to activate keys on other KMEs (see
+    /// [`Self::activate_keys_on_other_kme`]). Defaults to classical HTTPS; calling this switches
+    /// to whatever transport is passed (e.g. Zenoh+Raft).
+    /// # Arguments
+    /// * `transport` - The inter-KME transport to use from now on
+    pub(crate) async fn set_inter_kme_transport(&self, transport: Arc<dyn InterKmeTransport>) {
+        *self.inter_kme_transport.write().await = transport;
     }
 
     /// Add a new SAE ID to the database
@@ -480,11 +512,37 @@ impl KeyHandler {
             // - other SAE belongs to other KME (statically managed for now)
             let uuids_list = fetched_preinit_keys.iter().map(|(_, key_uuid, _)| key_uuid.clone()).collect::<Vec<_>>();
 
-            self.activate_keys_on_other_kme(origin_sae_id, target_kme_id, target_sae_id, uuids_list).map_err(|qkd_manager_activation_error| {
+            // If a Raft coordinator is configured, this KME is the master (it holds the key and
+            // initiates the exchange): ask the cluster to authorize starting the sync *before*
+            // pushing anything over the classical inter-KME network.
+            // Note: `target_kme_id` (a numeric `KmeId`) is used as a stand-in for the Zenoh
+            // `slave_kme` node identifier here; there is no established mapping between the two
+            // identifier spaces yet (see repo memory for details), which a later phase should resolve.
+            if let Some(authorizer) = self.raft_authorizer.read().await.clone() {
+                for key_uuid in &uuids_list {
+                    authorizer.authorize_transition(key_uuid, &target_kme_id.to_string(), ZenohKeyState::Syncing).await.map_err(|e| {
+                        error!("Raft cluster rejected Generated -> Syncing for key {}: {}", key_uuid, e);
+                        QkdManagerResponse::RaftConsensusRejected
+                    })?;
+                }
+            }
+
+            self.activate_keys_on_other_kme(origin_sae_id, target_kme_id, target_sae_id, uuids_list.clone()).map_err(|qkd_manager_activation_error| {
                 error!("Error activating key on other KME");
                 qkd_manager_activation_error
             }).await?;
             export_important_logging_message!(&self, &format!("As SAE {} belongs to KME {}, activating it through inter KMEs network", target_sae_id, target_kme_id));
+
+            // The remote KME accepted the activation: authorize moving to InUse now that both
+            // sides are synced, before this KME commits its own local activation below.
+            if let Some(authorizer) = self.raft_authorizer.read().await.clone() {
+                for key_uuid in &uuids_list {
+                    authorizer.authorize_transition(key_uuid, &target_kme_id.to_string(), ZenohKeyState::InUse).await.map_err(|e| {
+                        error!("Raft cluster rejected Syncing -> InUse for key {}: {}", key_uuid, e);
+                        QkdManagerResponse::RaftConsensusRejected
+                    })?;
+                }
+            }
         }
 
         let mut transaction = self.db.begin().await.map_err(|e| {
@@ -568,6 +626,22 @@ impl KeyHandler {
 
         let retrieved_preinit_key_tuples: Vec<(String, i64, Vec<u8>)> = join_all(retrieved_preinit_key_tuples_futures).await.into_iter().collect::<Result<Vec<_>, _>>()?;
 
+        // If a Raft coordinator is configured, this KME is the slave (it received a push over the
+        // classical inter-KME network): only agree to activate locally once Raft confirms *this
+        // cluster* already committed the master's Syncing proposal for each key. This is a
+        // read-only check: the slave never proposes a transition itself, since the master already
+        // owns and drives both transitions (Generated -> Syncing before this call, Syncing ->
+        // InUse after it returns) -- proposing here again would race with the master and could be
+        // rejected by the leader as a stale transition.
+        if let Some(authorizer) = self.raft_authorizer.read().await.clone() {
+            for (key_uuid, _, _) in &retrieved_preinit_key_tuples {
+                if authorizer.current_state(key_uuid) != Some(ZenohKeyState::Syncing) {
+                    error!("Raft cluster has not committed key {} to Syncing; refusing to activate it locally", key_uuid);
+                    return Err(QkdManagerResponse::RaftConsensusRejected);
+                }
+            }
+        }
+
         let mut transaction = self.db.begin().await.map_err(|e| {
             error!("Error starting SQL transaction: {:?}", e);
             QkdManagerResponse::Ko
@@ -595,73 +669,8 @@ impl KeyHandler {
     }
 
     async fn activate_keys_on_other_kme(&self, caller_master_sae_id: SaeId, other_kme_id: KmeId, other_sae_id: SaeId, key_uuids: Vec<String>) -> Result<(), QkdManagerResponse> {
-        let danger_should_ignore_remote_kme_cert = match std::env::var(crate::DANGER_IGNORE_CERTS_INTER_KME_NETWORK_ENV_VARIABLE) {
-            Ok(val) => val == crate::ACTIVATED_ENV_VARIABLE_VALUE,
-            Err(_) => false,
-        };
-
-        let req_body = http_request_obj::ActivateKeyRemoteKME {
-            key_IDs_list: key_uuids,
-            origin_SAE_ID: caller_master_sae_id,
-            remote_SAE_ID: other_sae_id,
-        };
-        let qkd_router = self.qkd_router.read().await;
-        let kme_classical_info = match qkd_router.get_classical_connection_info_from_kme_id(other_kme_id) {
-            Some(info) => info,
-            None => {
-                error!("KME ID not found");
-                return Err(QkdManagerResponse::MissingRemoteKmeConfiguration);
-            },
-        };
-
-        // check if we already initialized a reqwest client for this KME
-        let maybe_client = {
-            let cache = self.other_kme_connections_cache.read().await;
-            cache.get(&other_kme_id).cloned()
-        };
-        let kme_client = match maybe_client {
-            Some(client) => client.clone(),
-            None => {
-                let kme_client_builder = reqwest::Client::builder().identity(kme_classical_info.tls_client_cert_identity.clone());
-
-                let kme_client_builder = if danger_should_ignore_remote_kme_cert {
-                    warn!("Because of {}, remote KME server certificate check is disabled. This is a dangerous setting, it breaks the whole protocol security", crate::DANGER_IGNORE_CERTS_INTER_KME_NETWORK_ENV_VARIABLE);
-                    kme_client_builder.danger_accept_invalid_certs(true)
-                } else {
-                    info!("Remote KME server certificate check is enabled. This is the default setting");
-                    kme_client_builder
-                };
-                let kme_client_builder = if kme_classical_info.should_ignore_system_proxy_settings {
-                    info!("Ignoring system proxy settings for remote KME route");
-                    kme_client_builder.no_proxy()
-                } else {
-                    info!("Using system proxy settings for remote KME route");
-                    kme_client_builder
-                };
-                let kme_client = kme_client_builder.build()
-                    .map_err(|_| {
-                        error!("Error building reqwest client");
-                        QkdManagerResponse::Ko
-                    })?;
-                self.other_kme_connections_cache.write().await.insert(other_kme_id, kme_client.clone());
-                kme_client
-            }
-        };
-
-        let response = kme_client.post(&format!("https://{}/keys/activate", kme_classical_info.ip_domain_port))
-            .json(&req_body)
-            .send().await
-            .map_err(|http_error| {
-                error!("Error sending HTTP request: {}", http_error);
-                QkdManagerResponse::RemoteKmeCommunicationError
-            })?;
-
-        if response.status() != reqwest::StatusCode::OK {
-            error!("Error activating key on other KME");
-            return Err(QkdManagerResponse::RemoteKmeAcceptError);
-        }
-
-        Ok(())
+        let transport = self.inter_kme_transport.read().await.clone();
+        transport.activate_key_on_remote_kme(caller_master_sae_id, other_kme_id, other_sae_id, key_uuids).await
     }
 
     async fn insert_activated_key(&self, key_uuid: &str, key: &[u8], origin_sae_id: SaeId, target_sae_id: SaeId, transaction: Option<&mut Transaction<'_, Any>>)-> Result<QkdManagerResponse, QkdManagerResponse> {
@@ -977,8 +986,11 @@ macro_rules! export_important_logging_message {
 mod tests {
     use crate::event_subscription::ImportantEventSubscriber;
     use crate::qkd_manager::http_response_obj::HttpResponseBody;
+    use crate::qkd_manager::inter_kme_transport::InterKmeTransport;
     use crate::qkd_manager::QkdManagerResponse;
-    use crate::RequestedKeyCount;
+    use crate::zenoh_transport::contract::ZenohKeyState;
+    use crate::zenoh_transport::raft::KeyLifecycleAuthorizer;
+    use crate::{KmeId, RequestedKeyCount, SaeId};
     use std::future::Future;
     use std::io::Error;
     use std::pin::Pin;
@@ -1005,6 +1017,68 @@ mod tests {
                     .write().await
                     .push(message);
                 Ok(())
+            })
+        }
+    }
+
+    /// Fake [`KeyLifecycleAuthorizer`] for `key_handler.rs`'s own unit tests: lets the gating
+    /// logic in `get_sae_keys`/`activate_key_uuids_sae` be exercised without a real Zenoh session.
+    struct FakeRaftAuthorizer {
+        accept: bool,
+        current_states: Vec<(String, ZenohKeyState)>,
+    }
+    impl FakeRaftAuthorizer {
+        fn accepting() -> Self {
+            Self { accept: true, current_states: vec![] }
+        }
+        fn rejecting() -> Self {
+            Self { accept: false, current_states: vec![] }
+        }
+        fn with_current_states(current_states: Vec<(String, ZenohKeyState)>) -> Self {
+            Self { accept: true, current_states }
+        }
+    }
+    impl KeyLifecycleAuthorizer for FakeRaftAuthorizer {
+        fn authorize_transition<'a>(&'a self, key_id: &'a str, _slave_kme: &'a str, _requested_state: ZenohKeyState) -> Pin<Box<dyn Future<Output = Result<(), Error>> + Send + 'a>> {
+            let accept = self.accept;
+            let key_id = key_id.to_string();
+            Box::pin(async move {
+                if accept {
+                    Ok(())
+                } else {
+                    Err(Error::new(std::io::ErrorKind::Other, format!("Raft cluster rejected transition of key '{key_id}'")))
+                }
+            })
+        }
+
+        fn current_state(&self, key_id: &str) -> Option<ZenohKeyState> {
+            self.current_states.iter().find(|(id, _)| id == key_id).map(|(_, state)| *state)
+        }
+    }
+
+    /// Fake [`InterKmeTransport`] for `key_handler.rs`'s own unit tests: lets the delegation in
+    /// `activate_keys_on_other_kme` be exercised (and its result asserted) without a real
+    /// classical HTTPS client or Zenoh session.
+    struct FakeInterKmeTransport {
+        accept: bool,
+    }
+    impl FakeInterKmeTransport {
+        fn accepting() -> Self {
+            Self { accept: true }
+        }
+        fn rejecting() -> Self {
+            Self { accept: false }
+        }
+    }
+    impl InterKmeTransport for FakeInterKmeTransport {
+        fn activate_key_on_remote_kme<'a>(&'a self, _caller_master_sae_id: SaeId, _other_kme_id: KmeId, _other_sae_id: SaeId, _key_uuids: Vec<String>) -> Pin<Box<dyn Future<Output = Result<(), QkdManagerResponse>> + Send + 'a>> {
+            let accept = self.accept;
+            Box::pin(async move {
+                if accept {
+                    Ok(())
+                } else {
+                    Err(QkdManagerResponse::RemoteKmeAcceptError)
+                }
             })
         }
     }
@@ -1216,6 +1290,130 @@ mod tests {
             }
         };
         assert_eq!(response_keys.keys.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_get_sae_keys_raft_gate_rejects_before_remote_activation() {
+        let key_handler = super::KeyHandler::new(":memory:", 1, None).await.unwrap();
+        let sae_certificate_serial = vec![0u8; CLIENT_CERT_SERIAL_SIZE_BYTES];
+        key_handler.add_sae(1, 1, &Some(sae_certificate_serial.clone())).await.unwrap();
+        key_handler.add_sae(2, 2, &None).await.unwrap(); // SAE 2 belongs to KME 2: cross-KME, so no certificate here
+
+        let key = crate::qkd_manager::PreInitQkdKeyWrapper {
+            other_kme_id: 2,
+            key_uuid: *uuid::Uuid::from_bytes([9u8; 16]).as_bytes(),
+            key: [9u8; crate::QKD_KEY_SIZE_BITS / 8],
+        };
+        key_handler.add_preinit_qkd_key(key).await.unwrap();
+
+        key_handler.set_raft_authorizer(Arc::new(FakeRaftAuthorizer::rejecting())).await;
+
+        // The Raft gate must reject (and never reach `activate_keys_on_other_kme`, which would
+        // otherwise fail with `MissingRemoteKmeConfiguration` since no classical net info is
+        // registered for KME 2 in this test).
+        let qkd_manager_response = key_handler.get_sae_keys(&sae_certificate_serial, 2, RequestedKeyCount::new(1).unwrap()).await;
+        assert!(matches!(qkd_manager_response, Err(QkdManagerResponse::RaftConsensusRejected)));
+    }
+
+    #[tokio::test]
+    async fn test_get_sae_keys_raft_gate_accepts_and_proceeds_to_remote_activation() {
+        let key_handler = super::KeyHandler::new(":memory:", 1, None).await.unwrap();
+        let sae_certificate_serial = vec![0u8; CLIENT_CERT_SERIAL_SIZE_BYTES];
+        key_handler.add_sae(1, 1, &Some(sae_certificate_serial.clone())).await.unwrap();
+        key_handler.add_sae(2, 2, &None).await.unwrap(); // SAE 2 belongs to KME 2: cross-KME, so no certificate here
+
+        let key = crate::qkd_manager::PreInitQkdKeyWrapper {
+            other_kme_id: 2,
+            key_uuid: *uuid::Uuid::from_bytes([9u8; 16]).as_bytes(),
+            key: [9u8; crate::QKD_KEY_SIZE_BITS / 8],
+        };
+        key_handler.add_preinit_qkd_key(key).await.unwrap();
+
+        key_handler.set_raft_authorizer(Arc::new(FakeRaftAuthorizer::accepting())).await;
+
+        // The Raft gate must accept and let execution reach `activate_keys_on_other_kme`, which
+        // then fails on its own (no classical net info registered for KME 2 in this test) -
+        // proving the gate is not what blocked the request.
+        let qkd_manager_response = key_handler.get_sae_keys(&sae_certificate_serial, 2, RequestedKeyCount::new(1).unwrap()).await;
+        assert!(matches!(qkd_manager_response, Err(QkdManagerResponse::MissingRemoteKmeConfiguration)));
+    }
+
+    #[tokio::test]
+    async fn test_get_sae_keys_uses_the_installed_inter_kme_transport() {
+        let key_handler = super::KeyHandler::new(":memory:", 1, None).await.unwrap();
+        let sae_certificate_serial = vec![0u8; CLIENT_CERT_SERIAL_SIZE_BYTES];
+        key_handler.add_sae(1, 1, &Some(sae_certificate_serial.clone())).await.unwrap();
+        key_handler.add_sae(2, 2, &None).await.unwrap(); // SAE 2 belongs to KME 2: cross-KME, so no certificate here
+
+        let key = crate::qkd_manager::PreInitQkdKeyWrapper {
+            other_kme_id: 2,
+            key_uuid: *uuid::Uuid::from_bytes([10u8; 16]).as_bytes(),
+            key: [10u8; crate::QKD_KEY_SIZE_BITS / 8],
+        };
+        key_handler.add_preinit_qkd_key(key).await.unwrap();
+
+        // No classical net info is registered for KME 2 at all, so this would fail with
+        // `MissingRemoteKmeConfiguration` if the default HTTPS transport were still in use;
+        // installing a fake transport instead must let the whole call succeed.
+        key_handler.set_inter_kme_transport(Arc::new(FakeInterKmeTransport::accepting())).await;
+        let qkd_manager_response = key_handler.get_sae_keys(&sae_certificate_serial, 2, RequestedKeyCount::new(1).unwrap()).await;
+        assert!(matches!(qkd_manager_response, Ok(QkdManagerResponse::Keys(_))));
+    }
+
+    #[tokio::test]
+    async fn test_get_sae_keys_propagates_the_installed_inter_kme_transport_rejection() {
+        let key_handler = super::KeyHandler::new(":memory:", 1, None).await.unwrap();
+        let sae_certificate_serial = vec![0u8; CLIENT_CERT_SERIAL_SIZE_BYTES];
+        key_handler.add_sae(1, 1, &Some(sae_certificate_serial.clone())).await.unwrap();
+        key_handler.add_sae(2, 2, &None).await.unwrap();
+
+        let key = crate::qkd_manager::PreInitQkdKeyWrapper {
+            other_kme_id: 2,
+            key_uuid: *uuid::Uuid::from_bytes([11u8; 16]).as_bytes(),
+            key: [11u8; crate::QKD_KEY_SIZE_BITS / 8],
+        };
+        key_handler.add_preinit_qkd_key(key).await.unwrap();
+
+        key_handler.set_inter_kme_transport(Arc::new(FakeInterKmeTransport::rejecting())).await;
+        let qkd_manager_response = key_handler.get_sae_keys(&sae_certificate_serial, 2, RequestedKeyCount::new(1).unwrap()).await;
+        assert!(matches!(qkd_manager_response, Err(QkdManagerResponse::RemoteKmeAcceptError)));
+    }
+
+    #[tokio::test]
+    async fn test_activate_key_uuids_sae_raft_gate_rejects_when_not_syncing() {
+        let key_handler = super::KeyHandler::new(":memory:", 2, None).await.unwrap(); // this KME is the slave here
+        let key_uuid = uuid::Uuid::from_bytes([7u8; 16]).to_string();
+        let key = crate::qkd_manager::PreInitQkdKeyWrapper {
+            other_kme_id: 1,
+            key_uuid: *uuid::Uuid::from_bytes([7u8; 16]).as_bytes(),
+            key: [7u8; crate::QKD_KEY_SIZE_BITS / 8],
+        };
+        key_handler.add_preinit_qkd_key(key).await.unwrap();
+
+        // No committed state at all for this key-id (`current_state` returns `None`): reject.
+        key_handler.set_raft_authorizer(Arc::new(FakeRaftAuthorizer::with_current_states(vec![]))).await;
+
+        let qkd_manager_response = key_handler.activate_key_uuids_sae(1, 2, vec![key_uuid]).await;
+        assert!(matches!(qkd_manager_response, Err(QkdManagerResponse::RaftConsensusRejected)));
+    }
+
+    #[tokio::test]
+    async fn test_activate_key_uuids_sae_raft_gate_accepts_when_syncing() {
+        let key_handler = super::KeyHandler::new(":memory:", 2, None).await.unwrap(); // this KME is the slave here
+        key_handler.add_sae(1, 1, &None).await.unwrap(); // origin SAE, belongs to the master KME
+        key_handler.add_sae(2, 2, &Some(vec![0u8; CLIENT_CERT_SERIAL_SIZE_BYTES])).await.unwrap(); // target SAE, belongs to this KME
+        let key_uuid = uuid::Uuid::from_bytes([8u8; 16]).to_string();
+        let key = crate::qkd_manager::PreInitQkdKeyWrapper {
+            other_kme_id: 1,
+            key_uuid: *uuid::Uuid::from_bytes([8u8; 16]).as_bytes(),
+            key: [8u8; crate::QKD_KEY_SIZE_BITS / 8],
+        };
+        key_handler.add_preinit_qkd_key(key).await.unwrap();
+
+        key_handler.set_raft_authorizer(Arc::new(FakeRaftAuthorizer::with_current_states(vec![(key_uuid.clone(), ZenohKeyState::Syncing)]))).await;
+
+        let qkd_manager_response = key_handler.activate_key_uuids_sae(1, 2, vec![key_uuid]).await;
+        assert_eq!(qkd_manager_response.unwrap(), QkdManagerResponse::Ok);
     }
 
     #[tokio::test]
