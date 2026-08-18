@@ -16,6 +16,7 @@ use uuid::Uuid;
 use super::contract::{ZenohEtsiVersionResponse, ZenohTopicMap, ZENOH_CONTRACT_VERSION};
 use super::inter_kme_transport::{self, ZenohInterKmeTransport};
 use super::messages::ZenohEnvelope;
+use super::persistence;
 use super::raft;
 use super::config::ZenohTransportConfig;
 
@@ -117,7 +118,10 @@ impl ZenohTransport {
 
         self.spawn_own_version_queryable(&session).await?;
         self.spawn_own_subscribers(&session).await?;
-        let key_states = raft::spawn(&self.config, &session).await?;
+        // Phase 7: durably persist Raft-lite key states/commits in this KME's own database
+        // (reusing `qkd_manager`'s existing connection pool) so consensus survives a restart.
+        let persistence = persistence::RaftPersistence::new(qkd_manager.db_pool(), qkd_manager.dbms_type()).await?;
+        let key_states = raft::spawn(&self.config, &session, persistence).await?;
 
         // Real (non-demo) inter-KME wiring: service incoming activation requests, and make
         // outgoing ones (from qkd_manager's business logic) go out over Zenoh instead of

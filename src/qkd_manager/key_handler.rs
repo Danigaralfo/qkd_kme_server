@@ -28,7 +28,7 @@ use x509_parser::nom::AsBytes;
 
 /// Supported database management systems
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
-enum DbmsType {
+pub(crate) enum DbmsType {
     Sqlite,
     Postgres,
     MySQL,
@@ -135,6 +135,15 @@ impl KeyHandler {
             io::Error::new(io::ErrorKind::InvalidInput, format!("Error creating database tables: {:?}", e))
         })?;
         Ok(key_handler)
+    }
+
+    pub(crate) fn db_pool(&self) -> sqlx::AnyPool {
+        self.db.clone()
+    }
+
+    /// The DBMS backing this KME's database, see [`Self::db_pool`].
+    pub(crate) fn dbms_type(&self) -> DbmsType {
+        self.dbms_type
     }
 
     fn get_dbms_type_from_uri(db_uri: &str) -> Result<DbmsType, io::Error> {

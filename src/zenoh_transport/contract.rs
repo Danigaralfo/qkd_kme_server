@@ -146,8 +146,14 @@ pub struct ZenohRaftStateUpdate {
     pub request_id: String,
     /// Identifier of the key whose state changed.
     pub key_id: String,
+    /// State observed before the transition
+    pub from_state: ZenohKeyState,
     /// The committed key state.
     pub state: ZenohKeyState,
+    /// Identifier of the node that originated the request
+    pub master_kme: String,
+    /// Identifier of the remote node involved in the synchronization
+    pub slave_kme: String,
     /// Whether the update is already committed in the cluster.
     pub committed: bool,
 }

@@ -54,6 +54,7 @@ use super::contract::{
     ZenohKeyState, ZenohRaftReplicateAck, ZenohRaftStateUpdate, ZenohRaftTransitionDecision,
     ZenohRaftTransitionRequest, ZenohTopicMap,
 };
+use super::persistence::RaftPersistence;
 
 /// How long the leader waits for a quorum of acks on a single proposal
 /// before giving up on it and rejecting it to the requester.
@@ -132,8 +133,13 @@ struct PendingProposal {
 struct CommitOutcome {
     request_id: String,
     key_id: String,
+    /// State observed before the transition, carried through so the durable persistence
+    /// layer (see `crate::zenoh_transport::persistence`) can record a full audit entry
+    /// without needing to look anything else up.
+    from_state: ZenohKeyState,
     state: ZenohKeyState,
     requester_kme: String,
+    slave_kme: String,
 }
 
 /// A proposal that failed to reach quorum before [`RAFT_ACK_TIMEOUT`] elapsed.
@@ -233,8 +239,10 @@ impl LeaderState {
         Some(CommitOutcome {
             request_id: request_id.to_string(),
             key_id: proposal.request.key_id,
+            from_state: proposal.request.current_state,
             state: proposal.request.requested_state,
             requester_kme: proposal.request.master_kme,
+            slave_kme: proposal.request.slave_kme,
         })
     }
 
@@ -404,18 +412,34 @@ impl KeyLifecycleAuthorizer for RaftKeyCoordinator {
 /// `config.raft.leader_id`. Returns a [`KeyStates`] view that is kept
 /// up to date with every commit this node observes (as leader or follower),
 /// for business logic to consult via [`RaftKeyCoordinator`].
-pub(super) async fn spawn(config: &ZenohTransportConfig, session: &zenoh::Session) -> Result<KeyStates, io::Error> {
+///
+/// `persistence` (Phase 7) is used to restore this node's last committed key states before
+/// any subscriber starts, and to durably record every future commit - see
+/// `crate::zenoh_transport::persistence` for the rationale and what is/isn't persisted.
+pub(super) async fn spawn(config: &ZenohTransportConfig, session: &zenoh::Session, persistence: RaftPersistence) -> Result<KeyStates, io::Error> {
     match role_for(config) {
-        RaftRole::Leader => spawn_leader(config, session).await,
-        RaftRole::Follower => spawn_follower(config, session).await,
+        RaftRole::Leader => spawn_leader(config, session, persistence).await,
+        RaftRole::Follower => spawn_follower(config, session, persistence).await,
     }
 }
 
-async fn spawn_leader(config: &ZenohTransportConfig, session: &zenoh::Session) -> Result<KeyStates, io::Error> {
+async fn spawn_leader(config: &ZenohTransportConfig, session: &zenoh::Session, persistence: RaftPersistence) -> Result<KeyStates, io::Error> {
     let node_id = config.node_id.clone();
     let followers: Vec<String> = config.raft.cluster_members.iter().filter(|member| *member != &node_id).cloned().collect();
-    let state = Arc::new(Mutex::new(LeaderState::new(config.raft.cluster_members.clone())));
+
+    let restored_states = persistence.load_all_key_states().await?;
+    info!(
+        "Zenoh Raft: node '{}' restored {} persisted key state(s) from durable storage",
+        node_id,
+        restored_states.len()
+    );
+    let mut leader_state = LeaderState::new(config.raft.cluster_members.clone());
+    leader_state.committed_states = restored_states.clone();
+    let state = Arc::new(Mutex::new(leader_state));
     let key_states = KeyStates::new();
+    for (key_id, key_state) in restored_states {
+        key_states.set(key_id.as_str(), key_state);
+    }
 
     info!(
         "Zenoh Raft: node '{}' starting as leader over cluster {:?} (quorum {})",
@@ -425,12 +449,12 @@ async fn spawn_leader(config: &ZenohTransportConfig, session: &zenoh::Session) -
     );
 
     spawn_leader_request_subscriber(node_id.clone(), session.clone(), followers.clone(), state.clone()).await?;
-    spawn_leader_ack_subscriber(node_id.clone(), session.clone(), followers.clone(), state.clone(), key_states.clone()).await?;
+    spawn_leader_ack_subscriber(node_id.clone(), session.clone(), followers.clone(), state.clone(), key_states.clone(), persistence).await?;
     spawn_leader_retry_and_timeout_task(node_id, session.clone(), followers, state);
     Ok(key_states)
 }
 
-async fn spawn_follower(config: &ZenohTransportConfig, session: &zenoh::Session) -> Result<KeyStates, io::Error> {
+async fn spawn_follower(config: &ZenohTransportConfig, session: &zenoh::Session, persistence: RaftPersistence) -> Result<KeyStates, io::Error> {
     let node_id = config.node_id.clone();
     let leader_id = match config.raft.leader_id.clone() {
         Some(leader_id) => leader_id,
@@ -441,9 +465,19 @@ async fn spawn_follower(config: &ZenohTransportConfig, session: &zenoh::Session)
     };
     info!("Zenoh Raft: node '{}' starting as follower of leader '{}'", node_id, leader_id);
 
+    let restored_states = persistence.load_all_key_states().await?;
+    info!(
+        "Zenoh Raft: node '{}' restored {} persisted key state(s) from durable storage",
+        node_id,
+        restored_states.len()
+    );
     let key_states = KeyStates::new();
-    spawn_follower_request_subscriber(node_id.clone(), session.clone(), leader_id, key_states.clone()).await?;
-    spawn_follower_state_update_subscriber(node_id, session.clone(), key_states.clone()).await?;
+    for (key_id, key_state) in restored_states {
+        key_states.set(key_id.as_str(), key_state);
+    }
+
+    spawn_follower_request_subscriber(node_id.clone(), session.clone(), leader_id, key_states.clone(), persistence.clone()).await?;
+    spawn_follower_state_update_subscriber(node_id, session.clone(), key_states.clone(), persistence).await?;
     Ok(key_states)
 }
 
@@ -574,6 +608,7 @@ async fn spawn_leader_ack_subscriber(
     followers: Vec<String>,
     state: Arc<Mutex<LeaderState>>,
     key_states: KeyStates,
+    persistence: RaftPersistence,
 ) -> Result<(), io::Error> {
     let topic = ZenohTopicMap::raft_replicate_ack_topic(node_id.as_str());
     let subscriber = session
@@ -602,10 +637,28 @@ async fn spawn_leader_ack_subscriber(
                                 node_id, commit.request_id, commit.key_id, commit.state
                             );
                             key_states.set(commit.key_id.as_str(), commit.state);
+                            // Persist before broadcasting: on restart, this node must never forget
+                            // a transition it has already told the rest of the cluster about.
+                            if let Err(e) = persistence
+                                .record_commit(
+                                    commit.request_id.as_str(),
+                                    commit.key_id.as_str(),
+                                    commit.from_state,
+                                    commit.state,
+                                    commit.requester_kme.as_str(),
+                                    commit.slave_kme.as_str(),
+                                )
+                                .await
+                            {
+                                error!("Zenoh Raft leader '{}': failed to durably persist commit '{}': {e}", node_id, commit.request_id);
+                            }
                             let state_update = ZenohRaftStateUpdate {
                                 request_id: commit.request_id.clone(),
                                 key_id: commit.key_id.clone(),
+                                from_state: commit.from_state,
                                 state: commit.state,
+                                master_kme: commit.requester_kme.clone(),
+                                slave_kme: commit.slave_kme.clone(),
                                 committed: true,
                             };
                             for follower in &followers {
@@ -645,6 +698,7 @@ async fn spawn_follower_request_subscriber(
     session: zenoh::Session,
     leader_id: String,
     local_states: KeyStates,
+    persistence: RaftPersistence,
 ) -> Result<(), io::Error> {
     let topic = ZenohTopicMap::raft_transition_request_topic(node_id.as_str());
     let subscriber = session
@@ -657,14 +711,34 @@ async fn spawn_follower_request_subscriber(
             match sample.payload().try_to_string() {
                 Ok(payload) => match serde_json::from_str::<ZenohRaftTransitionRequest>(&payload) {
                     Ok(request) => {
-                        let current = local_states.get(request.key_id.as_str()).unwrap_or(ZenohKeyState::Generated);
-                        let accepted = current == request.current_state && is_valid_transition(current, request.requested_state);
-                        if !accepted {
-                            error!(
-                                "Zenoh Raft follower '{}': rejecting replicated proposal '{}' for key '{}' (local state {:?}, request claims {:?} -> {:?})",
-                                node_id, request.request_id, request.key_id, current, request.current_state, request.requested_state
-                            );
-                        }
+                        // A request_id already durably committed means the leader is replaying a
+                        // proposal this follower actually accepted before (its earlier ack was
+                        // likely lost). This node's local state has since moved on past
+                        // `request.current_state`, so re-validating against it would wrongly
+                        // reject a proposal already applied - just re-ack it as accepted instead.
+                        let already_committed = match persistence.is_request_already_committed(request.request_id.as_str()).await {
+                            Ok(already_committed) => already_committed,
+                            Err(e) => {
+                                error!(
+                                    "Zenoh Raft follower '{}': failed to check persisted history for '{}': {e}",
+                                    node_id, request.request_id
+                                );
+                                false
+                            }
+                        };
+                        let accepted = if already_committed {
+                            true
+                        } else {
+                            let current = local_states.get(request.key_id.as_str()).unwrap_or(ZenohKeyState::Generated);
+                            let accepted = current == request.current_state && is_valid_transition(current, request.requested_state);
+                            if !accepted {
+                                error!(
+                                    "Zenoh Raft follower '{}': rejecting replicated proposal '{}' for key '{}' (local state {:?}, request claims {:?} -> {:?})",
+                                    node_id, request.request_id, request.key_id, current, request.current_state, request.requested_state
+                                );
+                            }
+                            accepted
+                        };
                         let ack = ZenohRaftReplicateAck {
                             request_id: request.request_id.clone(),
                             follower_kme: node_id.clone(),
@@ -694,6 +768,7 @@ async fn spawn_follower_state_update_subscriber(
     node_id: String,
     session: zenoh::Session,
     local_states: KeyStates,
+    persistence: RaftPersistence,
 ) -> Result<(), io::Error> {
     let topic = ZenohTopicMap::raft_state_update_topic(node_id.as_str());
     let subscriber = session
@@ -708,6 +783,22 @@ async fn spawn_follower_state_update_subscriber(
                     Ok(update) => {
                         if update.committed {
                             local_states.set(update.key_id.as_str(), update.state);
+                            if let Err(e) = persistence
+                                .record_commit(
+                                    update.request_id.as_str(),
+                                    update.key_id.as_str(),
+                                    update.from_state,
+                                    update.state,
+                                    update.master_kme.as_str(),
+                                    update.slave_kme.as_str(),
+                                )
+                                .await
+                            {
+                                error!(
+                                    "Zenoh Raft follower '{}': failed to durably persist commit '{}': {e}",
+                                    node_id, update.request_id
+                                );
+                            }
                             info!(
                                 "Zenoh Raft follower '{}': applied committed transition '{}' for key '{}' -> {:?}",
                                 node_id, update.request_id, update.key_id, update.state

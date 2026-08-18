@@ -1,6 +1,6 @@
 //! QKD key handler interface, to communicate with QKD manager thread (authentication, database...)
 
-mod key_handler;
+pub(crate) mod key_handler;
 pub(crate) mod http_response_obj;
 pub(crate) mod http_request_obj;
 mod router;
@@ -72,6 +72,18 @@ impl QkdManager {
     pub async fn from_config(config: &crate::config::Config) -> Result<Arc<Self>, io::Error> {
         let qkd_manager = config_extractor::ConfigExtractor::extract_config_to_qkd_manager(config).await?;
         Ok(qkd_manager)
+    }
+
+    /// This KME's live database connection pool, for other crate-internal subsystems
+    /// (currently only Raft persistence, see `crate::zenoh_transport::persistence`) that
+    /// need to durably store their own state in the same database.
+    pub(crate) fn db_pool(&self) -> sqlx::AnyPool {
+        self.key_handler.db_pool()
+    }
+
+    /// The DBMS backing this KME's database, see [`Self::db_pool`].
+    pub(crate) fn dbms_type(&self) -> key_handler::DbmsType {
+        self.key_handler.dbms_type()
     }
 
     /// Add a new QKD key to the database
