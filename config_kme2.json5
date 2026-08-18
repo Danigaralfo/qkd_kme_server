@@ -26,6 +26,7 @@
       "server_cert_path": "certs/kme-2-local-zone/kme_server.crt", // KME server cert for SAE connections
       "server_key_path": "certs/kme-2-local-zone/kme_server.key" // KME server key for SAE connections
     },
+    "log_level": "info", // Optional log verbosity: error, warn, info, debug or trace (defaults to info)
     "kmes_https_interface": {
       "listen_address": "0.0.0.0:14001", // Listening address for inter-KME connections
       "ca_client_cert_path": "certs/inter_kmes/ca_kme2.crt", // CA cert to validate inter-KME client certs

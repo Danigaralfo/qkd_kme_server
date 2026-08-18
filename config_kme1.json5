@@ -28,6 +28,7 @@
       "server_key_path": "certs/kme-1-local-zone/kme_server.key" // KME server key for SAE connections
     },
     "debugging_http_interface": "0.0.0.0:18080", // Optional HTTP debugging interface (unsecured, no auth)
+    "log_level": "info", // Optional log verbosity: error, warn, info, debug or trace (defaults to info)
     "kmes_https_interface": {
       "listen_address": "0.0.0.0:13001", // Listening address for inter-KME connections
       "ca_client_cert_path": "certs/inter_kmes/ca_kme1.crt", // CA cert to validate inter-KME client certs

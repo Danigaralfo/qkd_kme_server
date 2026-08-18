@@ -55,6 +55,11 @@ This object describes the KME itself
 - **`debugging_http_interface`** *(string, optional)*  
   An optional address for the debugging HTTP interface, to be consulted using a web browser (see below). It is only for demonstration purpose and should not be exposed to the public.
 
+- **`log_level`** *(string, optional)*  
+  Log verbosity: one of `"error"`, `"warn"`, `"info"`, `"debug"` or `"trace"` (case-insensitive).
+  Defaults to `"info"` if not set or if the value cannot be parsed. Can still be overridden at
+  runtime via the `RUST_LOG` environment variable.
+
 - **`kmes_https_interface`** *(object)*  
   This section describes the public HTTPS interface for remote KMEs
     - `listen_address` *(string)* — The address to listen KMEs HTTPS requests, such as 

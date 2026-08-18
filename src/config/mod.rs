@@ -65,6 +65,11 @@ pub struct ThisKmeConfig {
     pub kmes_https_interface: KMEsHttpsInterfaceConfig,
     /// Optional HTTP interface to see important debugging events
     pub debugging_http_interface: Option<String>,
+    /// Optional log verbosity, one of "error", "warn", "info", "debug" or "trace" (case-insensitive).
+    /// Defaults to "info" if not set or if the value cannot be parsed. Can still be overridden at
+    /// runtime via the `RUST_LOG` environment variable.
+    #[serde(default)]
+    pub log_level: Option<String>,
     /// Optional Zenoh transport configuration used when the Zenoh+Raft mode is selected
     #[serde(default)]
     pub zenoh_transport: Option<ZenohTransportConfig>,
