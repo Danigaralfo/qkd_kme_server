@@ -158,6 +158,18 @@ impl QkdManager {
         }
     }
 
+    /// Void (permanently delete) already-activated QKD key(s) (shall be called by the master SAE).
+    /// # Arguments
+    /// * `target_sae_id` - The ID of the target (slave) SAE the keys were shared with
+    /// * `auth_client_cert_serial` - The serial number of the client certificate of the caller master SAE, to authenticate and identify it
+    /// * `keys_uuids` - The UUIDs of the keys to void
+    /// # Returns
+    /// Ok if the keys were voided successfully, an error otherwise (e.g. `NotFound` if a key doesn't belong to this SAE pair,
+    /// or `RaftConsensusRejected` if the key isn't currently `InUse` on a cross-KME exchange)
+    pub async fn void_qkd_keys(&self, target_sae_id: SaeId, auth_client_cert_serial: &SaeClientCertSerial, keys_uuids: Vec<String>) -> Result<QkdManagerResponse, QkdManagerResponse> {
+        self.key_handler.void_sae_keys(auth_client_cert_serial, target_sae_id, keys_uuids).await
+    }
+
     /// Add a new SAE to the database (shall be called before SAEs start requesting KME)
     /// # Arguments
     /// * `sae_id` - The ID of the SAE to add
@@ -235,6 +247,24 @@ impl QkdManager {
 
         if activate_key_uuid_qkd_manager_response != EXPECTED_QKD_MANAGER_RESPONSE {
             return Err(activate_key_uuid_qkd_manager_response);
+        }
+        Ok(EXPECTED_QKD_MANAGER_RESPONSE)
+    }
+
+    /// From a remote KME, void (permanently delete) already-activated key(s) on this KME, on
+    /// behalf of a master SAE belonging to that remote KME whose `void_qkd_keys` call was already
+    /// authorized by the Raft cluster (see [`crate::zenoh_transport::raft::KeyLifecycleAuthorizer`]).
+    /// # Arguments
+    /// * `key_uuids_list` - The UUIDs of the keys to void
+    /// # Returns
+    /// Ok if the keys were voided successfully, an error otherwise
+    pub async fn void_keys_from_remote(&self, key_uuids_list: Vec<String>) -> Result<QkdManagerResponse, QkdManagerResponse> {
+        const EXPECTED_QKD_MANAGER_RESPONSE: QkdManagerResponse = QkdManagerResponse::Ok;
+
+        let void_key_uuid_qkd_manager_response = self.key_handler.void_key_uuids_sae(key_uuids_list).await?;
+
+        if void_key_uuid_qkd_manager_response != EXPECTED_QKD_MANAGER_RESPONSE {
+            return Err(void_key_uuid_qkd_manager_response);
         }
         Ok(EXPECTED_QKD_MANAGER_RESPONSE)
     }

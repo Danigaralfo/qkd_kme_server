@@ -245,10 +245,24 @@ pub struct ZenohEtsiExtKeysAck {
 pub struct ZenohEtsiExtKeysVoid {
     /// Unique request identifier. UUIDv4 format.
     pub request_id: String,
+    /// KME that originated the void request, so the receiving KME knows where to ack.
+    pub master_kme: String,
     /// Key-IDs to be voided
     pub key_ids: Vec<String>,
     /// Human-readable void reason.
     pub reason: String,
+}
+
+/// Acknowledgement for a [`ZenohEtsiExtKeysVoid`] request, reporting whether the receiving KME
+/// accepted and applied it.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub struct ZenohEtsiExtKeysVoidAck {
+    /// Unique request identifier, matching the original [`ZenohEtsiExtKeysVoid`].
+    pub request_id: String,
+    /// Whether the receiving KME accepted and applied the void request.
+    pub accepted: bool,
+    /// Human-readable rejection reason, present when `accepted` is `false`.
+    pub reason: Option<String>,
 }
 
 /// Request to activate a set of already QKD-synchronized key-ids on a remote (slave) KME for a
@@ -311,6 +325,11 @@ impl ZenohTopicMap {
         format!("{slave_node_hostname}/kmapi/ext_keys/void")
     }
 
+    /// Build the acknowledgement topic for `/kmapi/v1/ext_keys/void`.
+    pub fn ext_keys_void_ack_topic(master_node_hostname: &str) -> String {
+        format!("{master_node_hostname}/kmapi/ext_keys/void/ack")
+    }
+
     /// Build the pub/sub topic for key activation requests, the Zenoh equivalent of the
     /// classical `/keys/activate` inter-KME route.
     pub fn activate_key_topic(slave_node_hostname: &str) -> String {
@@ -356,7 +375,7 @@ impl ZenohTopicMap {
 
 #[cfg(test)]
 mod tests {
-    use super::{ZenohActivateKeyAck, ZenohActivateKeyRequest, ZenohErrorCode, ZenohErrorResponse, ZenohEtsiExtKeysRequest, ZenohEtsiVersionQuery, ZenohEtsiVersionResponse, ZenohPlane, ZenohRaftReplicateAck, ZenohTopicMap, ZENOH_CONTRACT_VERSION};
+    use super::{ZenohActivateKeyAck, ZenohActivateKeyRequest, ZenohErrorCode, ZenohErrorResponse, ZenohEtsiExtKeysRequest, ZenohEtsiExtKeysVoid, ZenohEtsiExtKeysVoidAck, ZenohEtsiVersionQuery, ZenohEtsiVersionResponse, ZenohPlane, ZenohRaftReplicateAck, ZenohTopicMap, ZENOH_CONTRACT_VERSION};
 
     #[test]
     fn topic_map_follows_specification() {
@@ -365,6 +384,7 @@ mod tests {
         assert_eq!(ZenohTopicMap::ext_keys_topic("kme-b"), "kme-b/kmapi/ext_keys");
         assert_eq!(ZenohTopicMap::ext_keys_ack_topic("kme-a"), "kme-a/kmapi/ext_keys/ack");
         assert_eq!(ZenohTopicMap::ext_keys_void_topic("kme-b"), "kme-b/kmapi/ext_keys/void");
+        assert_eq!(ZenohTopicMap::ext_keys_void_ack_topic("kme-a"), "kme-a/kmapi/ext_keys/void/ack");
         assert_eq!(ZenohTopicMap::activate_key_topic("kme-b"), "kme-b/kmapi/activate");
         assert_eq!(ZenohTopicMap::activate_key_ack_topic("kme-a"), "kme-a/kmapi/activate/ack");
         assert_eq!(ZenohTopicMap::raft_replicate_ack_topic("kme-a"), "kme/kme-a/raft/state_transition/ack");
@@ -399,6 +419,36 @@ mod tests {
         assert!(accepted_json.contains("\"accepted\":true"));
         let rejected_json = serde_json::to_string(&rejected_ack).unwrap();
         assert!(rejected_json.contains("not in Syncing state"));
+    }
+
+    #[test]
+    fn ext_keys_void_and_ack_serialize_expected_fields() {
+        let request = ZenohEtsiExtKeysVoid {
+            request_id: String::from("req-void-1"),
+            master_kme: String::from("kme-a"),
+            key_ids: vec![String::from("key-1"), String::from("key-2")],
+            reason: String::from("SAE requested key void"),
+        };
+        let accepted_ack = ZenohEtsiExtKeysVoidAck {
+            request_id: String::from("req-void-1"),
+            accepted: true,
+            reason: None,
+        };
+        let rejected_ack = ZenohEtsiExtKeysVoidAck {
+            request_id: String::from("req-void-1"),
+            accepted: false,
+            reason: Some(String::from("not in InUse state")),
+        };
+
+        let request_json = serde_json::to_string(&request).unwrap();
+        assert!(request_json.contains("req-void-1"));
+        assert!(request_json.contains("key-1"));
+        assert!(request_json.contains("key-2"));
+
+        let accepted_json = serde_json::to_string(&accepted_ack).unwrap();
+        assert!(accepted_json.contains("\"accepted\":true"));
+        let rejected_json = serde_json::to_string(&rejected_ack).unwrap();
+        assert!(rejected_json.contains("not in InUse state"));
     }
 
     #[test]

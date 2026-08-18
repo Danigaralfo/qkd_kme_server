@@ -20,10 +20,13 @@ use std::time::Duration;
 use uuid::Uuid;
 
 use super::config::ZenohTransportConfig;
-use super::contract::{ZenohActivateKeyAck, ZenohActivateKeyRequest, ZenohTopicMap};
+use super::contract::{ZenohActivateKeyAck, ZenohActivateKeyRequest, ZenohEtsiExtKeysVoid, ZenohEtsiExtKeysVoidAck, ZenohTopicMap};
 
 /// How long the initiator waits for the remote KME to ack an activation request.
 const ACTIVATE_ACK_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// How long the initiator waits for the remote KME to ack a void request.
+const VOID_ACK_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Sends key activation requests to other KMEs over Zenoh instead of classical HTTPS.
 #[derive(Clone)]
@@ -62,6 +65,29 @@ impl InterKmeTransport for ZenohInterKmeTransport {
                 ACTIVATE_ACK_TIMEOUT,
             ).await.map_err(|e| {
                 error!("Zenoh inter-KME transport: activation request to '{}' failed: {e}", slave_node_id);
+                QkdManagerResponse::RemoteKmeCommunicationError
+            })
+        })
+    }
+
+    fn void_keys_on_remote_kme<'a>(
+        &'a self,
+        other_kme_id: KmeId,
+        key_uuids: Vec<String>,
+    ) -> Pin<Box<dyn Future<Output = Result<(), QkdManagerResponse>> + Send + 'a>> {
+        Box::pin(async move {
+            let Some(slave_node_id) = self.config.other_kme_node_ids.get(&other_kme_id) else {
+                error!("Zenoh inter-KME transport: no zenoh_node_id configured for other KME '{other_kme_id}'; add it to its `other_kmes` entry");
+                return Err(QkdManagerResponse::RemoteKmeCommunicationError);
+            };
+            send_void_request_and_await_ack(
+                &self.session,
+                self.config.node_id.as_str(),
+                slave_node_id.as_str(),
+                key_uuids,
+                VOID_ACK_TIMEOUT,
+            ).await.map_err(|e| {
+                error!("Zenoh inter-KME transport: void request to '{}' failed: {e}", slave_node_id);
                 QkdManagerResponse::RemoteKmeCommunicationError
             })
         })
@@ -168,4 +194,94 @@ async fn publish_json<T: serde::Serialize>(session: &zenoh::Session, topic: &str
         .put(topic, payload_json.as_str())
         .await
         .map_err(|e| io_err(&format!("Cannot publish payload: {e}")))
+}
+
+/// Master-side: publish a void request to `remote_node_id` and block (up to `timeout`) until it
+/// acks (accepted or rejected). Mirrors [`send_activate_request_and_await_ack`].
+async fn send_void_request_and_await_ack(
+    session: &zenoh::Session,
+    own_node_id: &str,
+    remote_node_id: &str,
+    key_ids: Vec<String>,
+    timeout: Duration,
+) -> Result<(), io::Error> {
+    // Subscribe to our own ack topic *before* publishing the request, so a fast responder can
+    // never ack before we start listening for it.
+    let ack_topic = ZenohTopicMap::ext_keys_void_ack_topic(own_node_id);
+    let subscriber = session
+        .declare_subscriber(ack_topic.as_str())
+        .await
+        .map_err(|e| io_err(&format!("Cannot declare Zenoh subscriber: {e}")))?;
+
+    let request = ZenohEtsiExtKeysVoid {
+        request_id: Uuid::new_v4().to_string(),
+        master_kme: own_node_id.to_string(),
+        key_ids,
+        reason: String::from("SAE requested key void"),
+    };
+    let request_topic = ZenohTopicMap::ext_keys_void_topic(remote_node_id);
+    publish_json(session, request_topic.as_str(), &request).await?;
+
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        if remaining.is_zero() {
+            return Err(io_err(&format!("Timed out waiting for void ack for request '{}'", request.request_id)));
+        }
+        let sample = match tokio::time::timeout(remaining, subscriber.recv_async()).await {
+            Ok(Ok(sample)) => sample,
+            Ok(Err(_)) => return Err(io_err("Zenoh void ack subscriber closed unexpectedly")),
+            Err(_) => return Err(io_err(&format!("Timed out waiting for void ack for request '{}'", request.request_id))),
+        };
+        match sample.payload().try_to_string() {
+            Ok(payload) => match serde_json::from_str::<ZenohEtsiExtKeysVoidAck>(&payload) {
+                Ok(ack) if ack.request_id != request.request_id => continue,
+                Ok(ack) if ack.accepted => return Ok(()),
+                Ok(ack) => return Err(io_err(&format!("Remote KME rejected void request: {}", ack.reason.unwrap_or_default()))),
+                Err(e) => error!("Zenoh void client '{}' <- cannot parse ack on '{ack_topic}': {e}", own_node_id),
+            },
+            Err(_) => info!("Zenoh void client '{}' <- received non-UTF8 ack on '{ack_topic}'", own_node_id),
+        }
+    }
+}
+
+/// Slave-side: subscribe to this node's own void topic and, on every request, actually void the
+/// keys through `qkd_manager` (the same call the classical `/keys/void` HTTPS route makes), then
+/// ack success or failure back to the requester. Mirrors [`spawn_activate_key_responder`].
+pub(super) async fn spawn_void_key_responder(node_id: String, session: zenoh::Session, qkd_manager: QkdManager) -> Result<(), io::Error> {
+    let topic = ZenohTopicMap::ext_keys_void_topic(node_id.as_str());
+    let subscriber = session
+        .declare_subscriber(topic.as_str())
+        .await
+        .map_err(|e| io_err(&format!("Cannot declare Zenoh subscriber: {e}")))?;
+
+    tokio::spawn(async move {
+        while let Ok(sample) = subscriber.recv_async().await {
+            match sample.payload().try_to_string() {
+                Ok(payload) => match serde_json::from_str::<ZenohEtsiExtKeysVoid>(&payload) {
+                    Ok(request) => {
+                        info!(
+                            "Zenoh void responder '{}': received void request for {} key(s) from '{}' (request '{}')",
+                            node_id, request.key_ids.len(), request.master_kme, request.request_id
+                        );
+                        let result = qkd_manager.void_keys_from_remote(request.key_ids.clone()).await;
+                        let ack = ZenohEtsiExtKeysVoidAck {
+                            request_id: request.request_id.clone(),
+                            accepted: result.is_ok(),
+                            reason: result.err().map(|e| format!("{e:?}")),
+                        };
+                        let ack_topic = ZenohTopicMap::ext_keys_void_ack_topic(request.master_kme.as_str());
+                        if let Err(e) = publish_json(&session, ack_topic.as_str(), &ack).await {
+                            error!("Zenoh void responder '{}': failed to publish ack for '{}': {e}", node_id, request.request_id);
+                        }
+                    }
+                    Err(e) => error!("Zenoh void responder '{}' <- cannot parse request on '{topic}': {e}", node_id),
+                },
+                Err(_) => info!("Zenoh void responder '{}' <- received non-UTF8 payload on '{topic}'", node_id),
+            }
+        }
+        error!("Zenoh void responder '{}' subscriber loop ended unexpectedly", node_id);
+    });
+
+    Ok(())
 }

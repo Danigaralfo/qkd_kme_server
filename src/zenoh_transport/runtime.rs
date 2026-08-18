@@ -127,6 +127,7 @@ impl ZenohTransport {
         // outgoing ones (from qkd_manager's business logic) go out over Zenoh instead of
         // classical HTTPS.
         inter_kme_transport::spawn_activate_key_responder(self.config.node_id.clone(), session.clone(), qkd_manager.clone()).await?;
+        inter_kme_transport::spawn_void_key_responder(self.config.node_id.clone(), session.clone(), qkd_manager.clone()).await?;
         qkd_manager.set_inter_kme_transport(Arc::new(ZenohInterKmeTransport::new(self.config.clone(), session.clone()))).await;
         // Gate real cross-KME key-state transitions on this same Raft cluster, so the state
         // machine built in Phase 5 is actually enforced for real SAE traffic.

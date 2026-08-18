@@ -28,6 +28,14 @@ pub trait InterKmeTransport: Send + Sync {
         other_sae_id: SaeId,
         key_uuids: Vec<String>,
     ) -> Pin<Box<dyn Future<Output = Result<(), QkdManagerResponse>> + Send + 'a>>;
+
+    /// Ask `other_kme_id` to void (permanently delete) `key_uuids` locally, after this KME's own
+    /// Raft-gated `InUse -> DeletedOrUsed` transition (if any) has already been authorized.
+    fn void_keys_on_remote_kme<'a>(
+        &'a self,
+        other_kme_id: KmeId,
+        key_uuids: Vec<String>,
+    ) -> Pin<Box<dyn Future<Output = Result<(), QkdManagerResponse>> + Send + 'a>>;
 }
 
 /// Classical, pre-Phase-6 implementation: activates keys on remote KMEs over mutually
@@ -120,6 +128,80 @@ impl InterKmeTransport for HttpsInterKmeTransport {
 
             if response.status() != reqwest::StatusCode::OK {
                 error!("Error activating key on other KME");
+                return Err(QkdManagerResponse::RemoteKmeAcceptError);
+            }
+
+            Ok(())
+        })
+    }
+
+    fn void_keys_on_remote_kme<'a>(
+        &'a self,
+        other_kme_id: KmeId,
+        key_uuids: Vec<String>,
+    ) -> Pin<Box<dyn Future<Output = Result<(), QkdManagerResponse>> + Send + 'a>> {
+        Box::pin(async move {
+            let danger_should_ignore_remote_kme_cert = match std::env::var(crate::DANGER_IGNORE_CERTS_INTER_KME_NETWORK_ENV_VARIABLE) {
+                Ok(val) => val == crate::ACTIVATED_ENV_VARIABLE_VALUE,
+                Err(_) => false,
+            };
+
+            let req_body = http_request_obj::VoidKeysRemoteKME {
+                key_IDs_list: key_uuids,
+            };
+            let qkd_router = self.qkd_router.read().await;
+            let kme_classical_info = match qkd_router.get_classical_connection_info_from_kme_id(other_kme_id) {
+                Some(info) => info,
+                None => {
+                    error!("KME ID not found");
+                    return Err(QkdManagerResponse::MissingRemoteKmeConfiguration);
+                },
+            };
+
+            // check if we already initialized a reqwest client for this KME
+            let maybe_client = {
+                let cache = self.other_kme_connections_cache.read().await;
+                cache.get(&other_kme_id).cloned()
+            };
+            let kme_client = match maybe_client {
+                Some(client) => client.clone(),
+                None => {
+                    let kme_client_builder = reqwest::Client::builder().identity(kme_classical_info.tls_client_cert_identity.clone());
+
+                    let kme_client_builder = if danger_should_ignore_remote_kme_cert {
+                        warn!("Because of {}, remote KME server certificate check is disabled. This is a dangerous setting, it breaks the whole protocol security", crate::DANGER_IGNORE_CERTS_INTER_KME_NETWORK_ENV_VARIABLE);
+                        kme_client_builder.danger_accept_invalid_certs(true)
+                    } else {
+                        log::info!("Remote KME server certificate check is enabled. This is the default setting");
+                        kme_client_builder
+                    };
+                    let kme_client_builder = if kme_classical_info.should_ignore_system_proxy_settings {
+                        log::info!("Ignoring system proxy settings for remote KME route");
+                        kme_client_builder.no_proxy()
+                    } else {
+                        log::info!("Using system proxy settings for remote KME route");
+                        kme_client_builder
+                    };
+                    let kme_client = kme_client_builder.build()
+                        .map_err(|_| {
+                            error!("Error building reqwest client");
+                            QkdManagerResponse::Ko
+                        })?;
+                    self.other_kme_connections_cache.write().await.insert(other_kme_id, kme_client.clone());
+                    kme_client
+                }
+            };
+
+            let response = kme_client.post(&format!("https://{}/keys/void", kme_classical_info.ip_domain_port))
+                .json(&req_body)
+                .send().await
+                .map_err(|http_error| {
+                    error!("Error sending HTTP request: {}", http_error);
+                    QkdManagerResponse::RemoteKmeCommunicationError
+                })?;
+
+            if response.status() != reqwest::StatusCode::OK {
+                error!("Error voiding key on other KME");
                 return Err(QkdManagerResponse::RemoteKmeAcceptError);
             }
 

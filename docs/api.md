@@ -248,3 +248,40 @@ Get the Shannon entropy of all the keys stored in the KME.
   "total_entropy": 7.919922493186846
 }
 ```
+
+## `POST /api/v1/keys/{slave SAE id}/void_keys`
+
+*This route should be called by the master SAE*
+
+Void (permanently delete) one or multiple keys previously exchanged between the master SAE (the caller) and
+the slave SAE. Once voided, a key can no longer be retrieved through `enc_keys`/`dec_keys`: it is
+irrecoverably deleted from both the master and the slave KME.
+
+If the master and slave SAEs belong to different KMEs, the master KME first asks the Raft cluster to
+authorize the `in_use -> deleted_or_used` transition for each key (rejected if a key isn't currently
+`in_use`), then notifies the slave KME so both sides delete their local copy of the key material.
+
+The key id(s) to void are the same ones returned when the key(s) were first exchanged (see `enc_keys`/`dec_keys`).
+
+### Request example:
+
+```json
+{
+  "key_IDs": [
+    {
+      "key_ID": "8844cba7-29e1-3251-a50a-25da13e65eea"
+    },
+    {
+      "key_ID": "8844cba7-29e1-3251-a50a-25da13e65eea"
+    }
+  ]
+}
+```
+
+### Response example:
+
+```json
+{
+  "message": "OK"
+}
+```

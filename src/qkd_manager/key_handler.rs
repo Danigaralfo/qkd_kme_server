@@ -820,6 +820,178 @@ impl KeyHandler {
         }))
     }
 
+    /// Void (permanently delete) one or multiple already-activated keys (shall be called by the master SAE).
+    ///
+    /// The key material is erased and unrecoverable: only the Raft cluster's commit history (see
+    /// `zenoh_transport::persistence`) records that the key ever existed and was voided. Once
+    /// voided, the key can no longer be retrieved by `enc_keys`/`dec_keys` (its row is simply gone).
+    /// # Arguments
+    /// * `origin_sae_certificate` - The client certificate serial of the caller (master) SAE
+    /// * `target_sae_id` - The ID of the target (slave) SAE the keys were shared with
+    /// * `keys_uuids` - The UUIDs of the keys to void
+    pub(crate) async fn void_sae_keys(&self, origin_sae_certificate: &SaeClientCertSerial, target_sae_id: SaeId, keys_uuids: Vec<String>) -> Result<QkdManagerResponse, QkdManagerResponse> {
+        const CHECK_ACTIVATED_KEY_EXISTS_STATEMENT: &'static str = "SELECT 1 FROM activated_keys WHERE key_uuid = $1 AND origin_sae_id = $2 AND target_sae_id = $3 LIMIT 1;";
+        const CHECK_ACTIVATED_KEY_EXISTS_STATEMENT_MYSQL: &'static str = "SELECT 1 FROM activated_keys WHERE key_uuid = ? AND origin_sae_id = ? AND target_sae_id = ? LIMIT 1;";
+
+        if keys_uuids.is_empty() {
+            return Ok(QkdManagerResponse::Ok);
+        }
+
+        let check_activated_key_exists_statement = match self.dbms_type {
+            DbmsType::MySQL => CHECK_ACTIVATED_KEY_EXISTS_STATEMENT_MYSQL,
+            DbmsType::Postgres | DbmsType::Sqlite => CHECK_ACTIVATED_KEY_EXISTS_STATEMENT,
+        };
+
+        let origin_sae_id = self.get_sae_id_from_certificate(origin_sae_certificate).await.ok_or(QkdManagerResponse::AuthenticationError)?;
+        let origin_kme_id = self.this_kme_id;
+        let target_kme_id = self.get_kme_id_from_sae_id(target_sae_id).await.ok_or(QkdManagerResponse::NotFound)?;
+
+        // Ensure every requested key really belongs to this (master, slave) SAE pair on this KME, before touching Raft consensus or notifying a remote KME
+        for key_uuid in &keys_uuids {
+            let stmt = ensure_prepared_statement_ok!(self.db, check_activated_key_exists_statement)?;
+            let query_args = prepare_sql_arguments!(key_uuid.as_str(), origin_sae_id, target_sae_id)?;
+            let found: Option<i64> = stmt.query_scalar_with(query_args).fetch_optional(&self.db).await.map_err(|e| {
+                error!("Error executing SQL statement: {:?}", e);
+                QkdManagerResponse::Ko
+            })?;
+            if found.is_none() {
+                return Err(QkdManagerResponse::NotFound);
+            }
+        }
+
+        export_important_logging_message!(&self, &format!("SAE {} requested to void {} key(s) shared with {}", origin_sae_id, keys_uuids.len(), target_sae_id));
+
+        if origin_kme_id != target_kme_id {
+            // Ask the Raft cluster to authorize the InUse -> DeletedOrUsed transition before erasing
+            // anything: the leader only accepts this transition if it currently sees the key as
+            // InUse (see `zenoh_transport::raft::is_valid_transition`), so a key that is not
+            // actually in use yet (or already voided) is rejected here without further action.
+            if let Some(authorizer) = self.raft_authorizer.read().await.clone() {
+                for key_uuid in &keys_uuids {
+                    authorizer.authorize_transition(key_uuid, &target_kme_id.to_string(), ZenohKeyState::DeletedOrUsed).await.map_err(|e| {
+                        error!("Raft cluster rejected InUse -> DeletedOrUsed for key {}: {}", key_uuid, e);
+                        QkdManagerResponse::RaftConsensusRejected
+                    })?;
+                }
+            }
+
+            self.void_keys_on_other_kme(target_kme_id, keys_uuids.clone()).map_err(|qkd_manager_void_error| {
+                error!("Error voiding keys on other KME");
+                qkd_manager_void_error
+            }).await?;
+            export_important_logging_message!(&self, &format!("As SAE {} belongs to KME {}, voiding key(s) through inter KMEs network", target_sae_id, target_kme_id));
+        }
+
+        let mut transaction = self.db.begin().await.map_err(|e| {
+            error!("Error starting SQL transaction: {:?}", e);
+            QkdManagerResponse::Ko
+        })?;
+
+        for key_uuid in &keys_uuids {
+            self.delete_activated_key_by_uuid(key_uuid, Some(&mut transaction)).await.map_err(|e| {
+                error!("Error deleting activated key {}: {:?}", key_uuid, e);
+                QkdManagerResponse::Ko
+            })?;
+        }
+
+        transaction.commit().await.map_err(|e| {
+            error!("Error committing SQL transaction: {:?}", e);
+            QkdManagerResponse::Ko
+        })?;
+
+        export_important_logging_message!(&self, &format!("Key(s) {} voided between SAEs {} and {}", keys_uuids.join(", "), origin_sae_id, target_sae_id));
+
+        Ok(QkdManagerResponse::Ok)
+    }
+
+    /// Void (permanently delete) already-activated keys on this KME, on behalf of a remote KME's
+    /// master SAE that already had its own `void_sae_keys` call authorized by the Raft cluster
+    /// (see [`Self::void_sae_keys`]). Reached over `InterKmeTransport` (classical HTTPS or Zenoh).
+    /// # Arguments
+    /// * `key_uuids_list` - The UUIDs of the keys to void
+    pub(crate) async fn void_key_uuids_sae(&self, key_uuids_list: Vec<String>) -> Result<QkdManagerResponse, QkdManagerResponse> {
+        // Read-only check: only agree to erase key material locally once Raft confirms *this
+        // cluster* already committed the DeletedOrUsed transition for each key - mirrors the
+        // read-only check `activate_key_uuids_sae` does for Syncing.
+        if let Some(authorizer) = self.raft_authorizer.read().await.clone() {
+            for key_uuid in &key_uuids_list {
+                if authorizer.current_state(key_uuid) != Some(ZenohKeyState::DeletedOrUsed) {
+                    error!("Raft cluster has not committed key {} to DeletedOrUsed; refusing to void it locally", key_uuid);
+                    return Err(QkdManagerResponse::RaftConsensusRejected);
+                }
+            }
+        }
+
+        let mut transaction = self.db.begin().await.map_err(|e| {
+            error!("Error starting SQL transaction: {:?}", e);
+            QkdManagerResponse::Ko
+        })?;
+
+        for key_uuid in &key_uuids_list {
+            self.delete_activated_key_by_uuid(key_uuid, Some(&mut transaction)).await.map_err(|e| {
+                error!("Error deleting activated key {}: {:?}", key_uuid, e);
+                QkdManagerResponse::Ko
+            })?;
+        }
+
+        transaction.commit().await.map_err(|e| {
+            error!("Error committing SQL transaction: {:?}", e);
+            QkdManagerResponse::Ko
+        })?;
+
+        info!("Key(s) {:?} voided on this KME following a remote void request", key_uuids_list);
+        Ok(QkdManagerResponse::Ok)
+    }
+
+    /// Permanently delete an activated key's material from the local database. There is no
+    /// recovery: only the Raft cluster's own commit history keeps track of the fact this key
+    /// existed and was voided (see `zenoh_transport::persistence`).
+    /// # Arguments
+    /// * `key_uuid` - The UUID of the key to delete
+    /// * `transaction` - An optional transaction to use for db requests, if None a new transaction will be created
+    async fn delete_activated_key_by_uuid(&self, key_uuid: &str, transaction: Option<&mut Transaction<'_, Any>>) -> Result<(), io::Error> {
+        const PREPARED_STATEMENT: &'static str = "DELETE FROM activated_keys WHERE key_uuid = $1;";
+        const PREPARED_STATEMENT_MYSQL: &'static str = "DELETE FROM activated_keys WHERE key_uuid = ?;";
+
+        let prepared_statement = match self.dbms_type {
+            DbmsType::MySQL => PREPARED_STATEMENT_MYSQL,
+            DbmsType::Postgres | DbmsType::Sqlite => PREPARED_STATEMENT,
+        };
+
+        let mut internal_transaction = None; // to keep the transaction alive if we create it
+        let transaction = match transaction {
+            Some(tx) => tx,
+            None => {
+                internal_transaction = Some(self.db.begin().await.map_err(|e| {
+                    io_err(format!("Error starting transaction: {:?}", e).as_str())
+                })?);
+                internal_transaction.as_mut().unwrap()
+            },
+        };
+
+        let stmt = ensure_prepared_statement_ok!(&mut **transaction, prepared_statement).map_err(|e| {
+            io_err(format!("Error preparing SQL statement: {:?}", e).as_str())
+        })?;
+        let query_args = prepare_sql_arguments!(key_uuid).map_err(|e| {
+            io_err(format!("Error binding key UUID: {:?}", e).as_str())
+        })?;
+        stmt.query_with(query_args).execute(&mut **transaction).await.map_err(|e| {
+            io_err(format!("Error executing SQL statement, maybe key UUID not found in activated keys database?: {:?}", e).as_str())
+        })?;
+        if let Some(tx) = internal_transaction {
+            tx.commit().await.map_err(|e| {
+                io_err(format!("Error committing transaction: {:?}", e).as_str())
+            })?;
+        }
+        Ok(())
+    }
+
+    /// Notify another KME, over whichever `InterKmeTransport` is configured, to void the same keys locally.
+    async fn void_keys_on_other_kme(&self, other_kme_id: KmeId, key_uuids: Vec<String>) -> Result<(), QkdManagerResponse> {
+        let transport = self.inter_kme_transport.read().await.clone();
+        transport.void_keys_on_remote_kme(other_kme_id, key_uuids).await
+    }
+
     /// Get the SAE ID from associated client certificate serial number
     /// # Arguments
     /// * `sae_certificate` - The client certificate serial number
@@ -1081,6 +1253,17 @@ mod tests {
     }
     impl InterKmeTransport for FakeInterKmeTransport {
         fn activate_key_on_remote_kme<'a>(&'a self, _caller_master_sae_id: SaeId, _other_kme_id: KmeId, _other_sae_id: SaeId, _key_uuids: Vec<String>) -> Pin<Box<dyn Future<Output = Result<(), QkdManagerResponse>> + Send + 'a>> {
+            let accept = self.accept;
+            Box::pin(async move {
+                if accept {
+                    Ok(())
+                } else {
+                    Err(QkdManagerResponse::RemoteKmeAcceptError)
+                }
+            })
+        }
+
+        fn void_keys_on_remote_kme<'a>(&'a self, _other_kme_id: KmeId, _key_uuids: Vec<String>) -> Pin<Box<dyn Future<Output = Result<(), QkdManagerResponse>> + Send + 'a>> {
             let accept = self.accept;
             Box::pin(async move {
                 if accept {
@@ -1466,6 +1649,162 @@ mod tests {
         // Revert origin and target SAE IDs
         let qkd_manager_response = key_handler.get_sae_keys_with_ids(&sae_1_certificate_serial, 2, vec!["00000000-0000-0000-0000-000000000000".to_string()]).await;
         assert!(matches!(qkd_manager_response, Err(QkdManagerResponse::NotFound)));
+    }
+
+    #[tokio::test]
+    async fn test_void_sae_keys_not_found() {
+        let key_handler = super::KeyHandler::new(":memory:", 1, None).await.unwrap();
+        let sae_certificate_serial = vec![0u8; CLIENT_CERT_SERIAL_SIZE_BYTES];
+        key_handler.add_sae(1, 1, &Some(sae_certificate_serial.clone())).await.unwrap();
+        key_handler.add_sae(2, 1, &Some(vec![1u8; CLIENT_CERT_SERIAL_SIZE_BYTES])).await.unwrap();
+
+        let qkd_manager_response = key_handler.void_sae_keys(&sae_certificate_serial, 2, vec!["00000000-0000-0000-0000-000000000000".to_string()]).await;
+        assert!(matches!(qkd_manager_response, Err(QkdManagerResponse::NotFound)));
+    }
+
+    #[tokio::test]
+    async fn test_void_sae_keys_same_kme_deletes_key() {
+        let key_handler = super::KeyHandler::new(":memory:", 1, None).await.unwrap();
+        let sae_1_certificate_serial = vec![0u8; CLIENT_CERT_SERIAL_SIZE_BYTES];
+        let sae_2_certificate_serial = vec![1u8; CLIENT_CERT_SERIAL_SIZE_BYTES];
+        key_handler.add_sae(1, 1, &Some(sae_1_certificate_serial.clone())).await.unwrap();
+        key_handler.add_sae(2, 1, &Some(sae_2_certificate_serial.clone())).await.unwrap();
+
+        let key = crate::qkd_manager::PreInitQkdKeyWrapper {
+            other_kme_id: 1,
+            key_uuid: *uuid::Uuid::from_bytes([20u8; 16]).as_bytes(),
+            key: [20u8; crate::QKD_KEY_SIZE_BITS / 8],
+        };
+        key_handler.add_preinit_qkd_key(key).await.unwrap();
+
+        // Master (SAE1) activates the key for slave SAE2 (both belong to this same KME)
+        assert!(matches!(key_handler.get_sae_keys(&sae_1_certificate_serial, 2, RequestedKeyCount::new(1).unwrap()).await.unwrap(), QkdManagerResponse::Keys(_)));
+
+        let key_uuid = uuid::Uuid::from_bytes([20u8; 16]).to_string();
+
+        // Slave (SAE2) can still retrieve it before voiding
+        assert!(matches!(key_handler.get_sae_keys_with_ids(&sae_2_certificate_serial, 1, vec![key_uuid.clone()]).await.unwrap(), QkdManagerResponse::Keys(_)));
+
+        // Master voids it
+        let qkd_manager_response = key_handler.void_sae_keys(&sae_1_certificate_serial, 2, vec![key_uuid.clone()]).await;
+        assert_eq!(qkd_manager_response.unwrap(), QkdManagerResponse::Ok);
+
+        // The key is now gone: it cannot be retrieved anymore
+        let qkd_manager_response = key_handler.get_sae_keys_with_ids(&sae_2_certificate_serial, 1, vec![key_uuid.clone()]).await;
+        assert!(matches!(qkd_manager_response, Err(QkdManagerResponse::NotFound)));
+
+        // Voiding again must fail: the row is already gone
+        let qkd_manager_response = key_handler.void_sae_keys(&sae_1_certificate_serial, 2, vec![key_uuid]).await;
+        assert!(matches!(qkd_manager_response, Err(QkdManagerResponse::NotFound)));
+    }
+
+    #[tokio::test]
+    async fn test_void_sae_keys_raft_gate_rejects() {
+        let key_handler = super::KeyHandler::new(":memory:", 1, None).await.unwrap();
+        let sae_certificate_serial = vec![0u8; CLIENT_CERT_SERIAL_SIZE_BYTES];
+        key_handler.add_sae(1, 1, &Some(sae_certificate_serial.clone())).await.unwrap();
+        key_handler.add_sae(2, 2, &None).await.unwrap(); // SAE 2 belongs to KME 2: cross-KME
+
+        let key_uuid = uuid::Uuid::from_bytes([21u8; 16]).to_string();
+        // Directly insert the activated key row, as if a prior cross-KME activation had already completed
+        key_handler.insert_activated_key(&key_uuid, &[21u8; crate::QKD_KEY_SIZE_BITS / 8], 1, 2, None).await.unwrap();
+
+        key_handler.set_raft_authorizer(Arc::new(FakeRaftAuthorizer::rejecting())).await;
+
+        // The Raft gate must reject (and never reach `void_keys_on_other_kme`, which would
+        // otherwise fail with `MissingRemoteKmeConfiguration` since no classical net info is
+        // registered for KME 2 in this test).
+        let qkd_manager_response = key_handler.void_sae_keys(&sae_certificate_serial, 2, vec![key_uuid]).await;
+        assert!(matches!(qkd_manager_response, Err(QkdManagerResponse::RaftConsensusRejected)));
+    }
+
+    #[tokio::test]
+    async fn test_void_sae_keys_raft_gate_accepts_and_notifies_remote() {
+        let key_handler = super::KeyHandler::new(":memory:", 1, None).await.unwrap();
+        let sae_certificate_serial = vec![0u8; CLIENT_CERT_SERIAL_SIZE_BYTES];
+        key_handler.add_sae(1, 1, &Some(sae_certificate_serial.clone())).await.unwrap();
+        key_handler.add_sae(2, 2, &None).await.unwrap();
+
+        let key_uuid = uuid::Uuid::from_bytes([22u8; 16]).to_string();
+        key_handler.insert_activated_key(&key_uuid, &[22u8; crate::QKD_KEY_SIZE_BITS / 8], 1, 2, None).await.unwrap();
+
+        key_handler.set_raft_authorizer(Arc::new(FakeRaftAuthorizer::accepting())).await;
+        key_handler.set_inter_kme_transport(Arc::new(FakeInterKmeTransport::accepting())).await;
+
+        let qkd_manager_response = key_handler.void_sae_keys(&sae_certificate_serial, 2, vec![key_uuid.clone()]).await;
+        assert_eq!(qkd_manager_response.unwrap(), QkdManagerResponse::Ok);
+
+        // The row is now gone locally too
+        let qkd_manager_response = key_handler.void_sae_keys(&sae_certificate_serial, 2, vec![key_uuid]).await;
+        assert!(matches!(qkd_manager_response, Err(QkdManagerResponse::NotFound)));
+    }
+
+    #[tokio::test]
+    async fn test_void_sae_keys_propagates_remote_transport_rejection() {
+        let key_handler = super::KeyHandler::new(":memory:", 1, None).await.unwrap();
+        let sae_certificate_serial = vec![0u8; CLIENT_CERT_SERIAL_SIZE_BYTES];
+        key_handler.add_sae(1, 1, &Some(sae_certificate_serial.clone())).await.unwrap();
+        key_handler.add_sae(2, 2, &None).await.unwrap();
+
+        let key_uuid = uuid::Uuid::from_bytes([23u8; 16]).to_string();
+        key_handler.insert_activated_key(&key_uuid, &[23u8; crate::QKD_KEY_SIZE_BITS / 8], 1, 2, None).await.unwrap();
+
+        key_handler.set_inter_kme_transport(Arc::new(FakeInterKmeTransport::rejecting())).await;
+
+        let qkd_manager_response = key_handler.void_sae_keys(&sae_certificate_serial, 2, vec![key_uuid.clone()]).await;
+        assert!(matches!(qkd_manager_response, Err(QkdManagerResponse::RemoteKmeAcceptError)));
+
+        // The local row must still be present: nothing was deleted since the remote KME rejected first
+        let qkd_manager_response = key_handler.void_sae_keys(&sae_certificate_serial, 2, vec![key_uuid]).await;
+        assert!(matches!(qkd_manager_response, Err(QkdManagerResponse::RemoteKmeAcceptError)));
+    }
+
+    #[tokio::test]
+    async fn test_void_key_uuids_sae_deletes_local_key() {
+        let key_handler = super::KeyHandler::new(":memory:", 2, None).await.unwrap(); // this KME is the slave here
+        let sae_2_certificate_serial = vec![0u8; CLIENT_CERT_SERIAL_SIZE_BYTES];
+        key_handler.add_sae(1, 1, &None).await.unwrap();
+        key_handler.add_sae(2, 2, &Some(sae_2_certificate_serial.clone())).await.unwrap();
+
+        let key_uuid = uuid::Uuid::from_bytes([24u8; 16]).to_string();
+        key_handler.insert_activated_key(&key_uuid, &[24u8; crate::QKD_KEY_SIZE_BITS / 8], 1, 2, None).await.unwrap();
+
+        // No Raft authorizer configured: classical mode, void proceeds without any consensus check
+        let qkd_manager_response = key_handler.void_key_uuids_sae(vec![key_uuid.clone()]).await;
+        assert_eq!(qkd_manager_response.unwrap(), QkdManagerResponse::Ok);
+
+        // The key is gone
+        let qkd_manager_response = key_handler.get_sae_keys_with_ids(&sae_2_certificate_serial, 1, vec![key_uuid]).await;
+        assert!(matches!(qkd_manager_response, Err(QkdManagerResponse::NotFound)));
+    }
+
+    #[tokio::test]
+    async fn test_void_key_uuids_sae_raft_gate_rejects_when_not_deleted_or_used() {
+        let key_handler = super::KeyHandler::new(":memory:", 2, None).await.unwrap();
+        key_handler.add_sae(1, 1, &None).await.unwrap();
+        key_handler.add_sae(2, 2, &Some(vec![0u8; CLIENT_CERT_SERIAL_SIZE_BYTES])).await.unwrap();
+        let key_uuid = uuid::Uuid::from_bytes([25u8; 16]).to_string();
+        key_handler.insert_activated_key(&key_uuid, &[25u8; crate::QKD_KEY_SIZE_BITS / 8], 1, 2, None).await.unwrap();
+
+        // Raft cluster's local view for this key is InUse, not (yet) DeletedOrUsed: reject
+        key_handler.set_raft_authorizer(Arc::new(FakeRaftAuthorizer::with_current_states(vec![(key_uuid.clone(), ZenohKeyState::InUse)]))).await;
+
+        let qkd_manager_response = key_handler.void_key_uuids_sae(vec![key_uuid]).await;
+        assert!(matches!(qkd_manager_response, Err(QkdManagerResponse::RaftConsensusRejected)));
+    }
+
+    #[tokio::test]
+    async fn test_void_key_uuids_sae_raft_gate_accepts_when_deleted_or_used() {
+        let key_handler = super::KeyHandler::new(":memory:", 2, None).await.unwrap();
+        key_handler.add_sae(1, 1, &None).await.unwrap();
+        key_handler.add_sae(2, 2, &Some(vec![0u8; CLIENT_CERT_SERIAL_SIZE_BYTES])).await.unwrap();
+        let key_uuid = uuid::Uuid::from_bytes([26u8; 16]).to_string();
+        key_handler.insert_activated_key(&key_uuid, &[26u8; crate::QKD_KEY_SIZE_BITS / 8], 1, 2, None).await.unwrap();
+
+        key_handler.set_raft_authorizer(Arc::new(FakeRaftAuthorizer::with_current_states(vec![(key_uuid.clone(), ZenohKeyState::DeletedOrUsed)]))).await;
+
+        let qkd_manager_response = key_handler.void_key_uuids_sae(vec![key_uuid]).await;
+        assert_eq!(qkd_manager_response.unwrap(), QkdManagerResponse::Ok);
     }
 
     #[tokio::test]

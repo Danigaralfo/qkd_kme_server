@@ -32,3 +32,10 @@ pub(crate) struct ActivateKeyRemoteKME {
     pub(crate) origin_SAE_ID: SaeId,
     pub(crate) remote_SAE_ID: SaeId,
 }
+
+/// From inter-KME network: a set of already-activated keys must be voided (permanently deleted) on this KME
+#[derive(Serialize, Deserialize, Debug)]
+#[allow(non_snake_case)]
+pub(crate) struct VoidKeysRemoteKME {
+    pub(crate) key_IDs_list: Vec<String>,
+}
