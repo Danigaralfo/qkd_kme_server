@@ -46,6 +46,17 @@ impl ZenohTransport {
     }
 
     fn build_session_config(&self) -> Result<zenoh::Config, io::Error> {
+        // mTLS is mandatory for the Zenoh transport: refuse to start rather than silently
+        // fall back to a plaintext link. Endpoints (`listen_endpoint`/`peers`/`router_endpoint`)
+        // are expected to use the `tls/` locator scheme when this is configured (see the
+        // shipped `config_kme*.json5` files for a working example).
+        let tls = self.config.tls.as_ref().ok_or_else(|| {
+            io_err(
+                "Zenoh transport requires mTLS configuration (zenoh_transport.tls): refusing to \
+                 start without it",
+            )
+        })?;
+
         let listen_endpoints_json = match &self.config.listen_endpoint {
             Some(endpoint) => serde_json::to_string(&vec![endpoint])
                 .map_err(|e| io_err(&format!("Cannot serialize Zenoh listen endpoint: {e}")))?,
@@ -61,11 +72,32 @@ impl ZenohTransport {
         let mode_json = serde_json::to_string(self.config.role.as_zenoh_mode_str())
             .map_err(|e| io_err(&format!("Cannot serialize Zenoh mode: {e}")))?;
 
+        let root_ca_certificate_json = serde_json::to_string(&tls.root_ca_certificate)
+            .map_err(|e| io_err(&format!("Cannot serialize Zenoh TLS root CA certificate path: {e}")))?;
+        // Same certificate/key presented for both roles: Zenoh's `transport.link.tls` still has
+        // separate listen/connect fields, but this node only has one identity.
+        let certificate_json = serde_json::to_string(&tls.certificate)
+            .map_err(|e| io_err(&format!("Cannot serialize Zenoh TLS certificate path: {e}")))?;
+        let private_key_json = serde_json::to_string(&tls.private_key)
+            .map_err(|e| io_err(&format!("Cannot serialize Zenoh TLS private key path: {e}")))?;
+
         let config_json = format!(
             r#"{{
   mode: {mode_json},
   connect: {{ endpoints: {connect_endpoints_json} }},
-  listen: {{ endpoints: {listen_endpoints_json} }}
+  listen: {{ endpoints: {listen_endpoints_json} }},
+  transport: {{
+    link: {{
+      tls: {{
+        root_ca_certificate: {root_ca_certificate_json},
+        listen_certificate: {certificate_json},
+        listen_private_key: {private_key_json},
+        connect_certificate: {certificate_json},
+        connect_private_key: {private_key_json},
+        enable_mtls: true
+      }}
+    }}
+  }}
 }}"#
         );
 

@@ -23,6 +23,14 @@ pub struct ZenohTransportConfig {
     /// (Phase 4). See [`RaftConfig`] for details and current limitations.
     #[serde(default)]
     pub raft: RaftConfig,
+    /// Mutual TLS configuration for the Zenoh session's underlying links.
+    ///
+    /// mTLS is mandatory for the `zenoh_raft` transport mode: [`crate::zenoh_transport::runtime::ZenohTransport`]
+    /// refuses to open a Zenoh session if this is not configured. It is kept optional at the type
+    /// level (defaulting to `None` when absent from the JSON5 config) purely so this struct stays
+    /// constructible via [`Default`] in tests; real deployments must always set it.
+    #[serde(default)]
+    pub tls: Option<ZenohTlsConfig>,
     /// Maps each other KME's numeric [`KmeId`] to its Zenoh `node_id` hostname, so point-to-point
     /// topics (e.g. the `/kmapi/activate` inter-KME transport) can address the right peer.
     /// Not part of the JSON `zenoh_transport` block itself: built from `other_kmes[].zenoh_node_id`
@@ -40,9 +48,30 @@ impl Default for ZenohTransportConfig {
             router_endpoint: None,
             role: ZenohNodeRole::Peer,
             raft: RaftConfig::default(),
+            tls: None,
             other_kme_node_ids: HashMap::new(),
         }
     }
+}
+
+/// Mutual TLS (mTLS) configuration for the Zenoh transport's underlying links.
+///
+/// A single certificate/key pair identifies this node, presented both when accepting inbound
+/// Zenoh connections and when dialing out to a peer.
+///
+/// `root_ca_certificate` is used to validate the remote peer's certificate in both roles, so it
+/// must be a CA (or CA bundle, i.e. a PEM file with multiple concatenated certificates) that can
+/// verify whichever node certificate the peer presents.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub struct ZenohTlsConfig {
+    /// Path to the CA certificate (or PEM bundle of multiple CA certificates) used to validate
+    /// the remote peer's certificate.
+    pub root_ca_certificate: String,
+    /// Path to this node's own certificate, presented both when accepting incoming Zenoh
+    /// connections and when dialing out to a peer.
+    pub certificate: String,
+    /// Path to this node's own private key for `certificate`.
+    pub private_key: String,
 }
 
 /// Raft cluster configuration for key-state transition consensus (Phase 4).

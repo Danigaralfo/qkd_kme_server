@@ -8,9 +8,14 @@
     "transport_mode": "zenoh_raft", // Startup transport mode: https or zenoh_raft
     "zenoh_transport": {
       "node_id": "kme-1-zenoh",
-      "listen_endpoint": "tcp/127.0.0.1:7447",
-      "peers": ["tcp/127.0.0.1:7448"],
+      "listen_endpoint": "tls/localhost:7447",
+      "peers": ["tls/localhost:7448"],
       "role": "peer",
+      "tls": {
+        "root_ca_certificate": "certs/inter_kmes/zenoh_ca_bundle.crt",    // CA bundle to validate the other KME's Zenoh cert
+        "certificate": "certs/inter_kmes/kme1_server.crt",                // KME Zenoh node cert (used for both server and client connections)
+        "private_key": "certs/inter_kmes/kme1_server.key"                 // KME Zenoh node key (used for both server and client connections)
+      },
       "raft": {
         "cluster_members": ["kme-1-zenoh", "kme-2-zenoh"], // Node-ids participating in Raft consensus, including this node
         "leader_id": "kme-1-zenoh" // Statically configured Raft leader (no election yet)
