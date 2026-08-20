@@ -40,6 +40,7 @@
 //! sensitive key-state transition.
 
 use crate::io_err;
+use crate::KmeId;
 use log::{error, info};
 use std::collections::{HashMap, HashSet};
 use std::future::Future;
@@ -384,11 +385,19 @@ impl KeyLifecycleAuthorizer for RaftKeyCoordinator {
             if current_state == ZenohKeyState::DeletedOrUsed {
                 return Err(io_err(&format!("Key '{key_id}' is already deleted/used; it cannot be transitioned again")));
             }
+            // `slave_kme` here is the numeric `KmeId` stringified by the caller (see
+            // `key_handler.rs`); resolve it to the real Zenoh `node_id` (if known) so the state
+            // update broadcast can actually reach it later, even if it's not a Raft cluster member
+            // (e.g. a hot-plugged KME that only acts as a Raft client - see
+            // `spawn_leader_ack_subscriber`).
+            let resolved_slave_kme = slave_kme.parse::<KmeId>().ok()
+                .and_then(|kme_id| self.config.other_kme_node_ids.get(&kme_id).cloned())
+                .unwrap_or_else(|| slave_kme.to_string());
             let decision = propose_transition_and_await_decision(
                 &self.config,
                 &self.session,
                 key_id,
-                slave_kme,
+                resolved_slave_kme.as_str(),
                 current_state,
                 requested_state,
                 KEY_LIFECYCLE_AUTHORIZATION_TIMEOUT,
@@ -665,6 +674,18 @@ async fn spawn_leader_ack_subscriber(
                                 let follower_topic = ZenohTopicMap::raft_state_update_topic(follower.as_str());
                                 if let Err(e) = publish_json(&session, follower_topic.as_str(), &state_update, "Zenoh Raft state update").await {
                                     error!("Zenoh Raft leader '{}': failed to publish state update to '{}': {e}", node_id, follower);
+                                }
+                            }
+                            // Always also reach the actual slave of this transaction, even if it's
+                            // not a Raft cluster member (e.g. a hot-plugged KME acting only as a
+                            // Raft client - see `RaftKeyCoordinator::authorize_transition`, which
+                            // already resolved `slave_kme` to a real node_id): without this, that
+                            // node's own local Raft gate (`current_state`) would never learn about
+                            // the commit and would wrongly reject storing the synced key.
+                            if commit.slave_kme != node_id && !followers.contains(&commit.slave_kme) {
+                                let slave_topic = ZenohTopicMap::raft_state_update_topic(commit.slave_kme.as_str());
+                                if let Err(e) = publish_json(&session, slave_topic.as_str(), &state_update, "Zenoh Raft state update").await {
+                                    error!("Zenoh Raft leader '{}': failed to publish state update to slave '{}': {e}", node_id, commit.slave_kme);
                                 }
                             }
                             let decision = ZenohRaftTransitionDecision {

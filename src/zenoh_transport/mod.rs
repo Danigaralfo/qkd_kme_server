@@ -13,6 +13,9 @@ pub mod raft;
 pub mod inter_kme_transport;
 /// Durable persistence for Raft-lite state (Phase 7), so restarts do not lose consensus.
 pub(crate) mod persistence;
+/// Live, shared `KmeId -> Zenoh node_id` registry, updated at runtime as new KMEs are discovered
+/// over Zenoh (hot-plug support), see `registry::KmeNodeRegistry`.
+pub(crate) mod registry;
 pub mod runtime;
 
 pub use runtime::ZenohTransport;

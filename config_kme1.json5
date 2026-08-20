@@ -2,15 +2,20 @@
   "this_kme": {
     "id": 1, // KME id over KME network
     "nickname": "Alice", // Optional KME nickname for logging
-    "db_uri": ":memory:", // SQLite db is in memory (could be a filename as well)
+    "db_uri": "sqlite://kme1_database.db",
     "delete_key_file_after_read": false, // Whether to delete key files after reading them (for in-memory database, set to false)
     "key_directory_to_watch": "raw_keys/kme-1-1", // Quantum Key directory for SAEs belonging to this KME (only to be compliant with standard, as these SAEs can use public key cryptography directly)
-    "transport_mode": "zenoh_raft", // Startup transport mode: https or zenoh_raft
+    "transport_mode": "https", // Startup transport mode: https or zenoh_raft
     "zenoh_transport": {
       "node_id": "kme-1-zenoh",
       "listen_endpoint": "tls/localhost:7447",
-      "peers": ["tls/localhost:7448"],
+      // Optional bootstrap hint, not required for reachability: peers/KMEs are discovered
+      // automatically via Zenoh scouting (multicast + gossip, enabled by default - see
+      // ZenohScoutingConfig). Kept here because multicast scouting over loopback can be
+      // unreliable in local dev setups; in a real deployment this can usually be omitted.
+      //"peers": ["tls/localhost:7448"],
       "role": "peer",
+      // "scouting": { "multicast_interface": "eth0" } // uncomment to pin the multicast interface (e.g. in multi-NIC containers)
       "tls": {
         "root_ca_certificate": "certs/inter_kmes/zenoh_ca_bundle.crt",    // CA bundle to validate the other KME's Zenoh cert
         "certificate": "certs/inter_kmes/kme1_server.crt",                // KME Zenoh node cert (used for both server and client connections)
@@ -28,7 +33,7 @@
       "server_key_path": "certs/kme-1-local-zone/kme_server.key" // KME server key for SAE connections
     },
     "debugging_http_interface": "0.0.0.0:18080", // Optional HTTP debugging interface (unsecured, no auth)
-    "log_level": "info", // Optional log verbosity: error, warn, info, debug or trace (defaults to info)
+    "log_level": "trace", // Optional log verbosity: error, warn, info, debug or trace (defaults to info)
     "kmes_https_interface": {
       "listen_address": "0.0.0.0:13001", // Listening address for inter-KME connections
       "ca_client_cert_path": "certs/inter_kmes/ca_kme1.crt", // CA cert to validate inter-KME client certs
@@ -45,6 +50,15 @@
       "https_client_authentication_certificate": "certs/inter_kmes/kme1-to-kme2.pfx", // Client cert to authenticate to the other KME
       "https_client_authentication_certificate_password": "password", // Password for the client cert (empty if none)
       "zenoh_node_id": "kme-2-zenoh" // Zenoh node_id of the other KME, used to address it directly when transport_mode is zenoh_raft
+    },
+    {
+      "id": 3, // KME id of the other KME
+      "key_directory_to_watch": "raw_keys/kme-1-3", // Quantum Key directory for communication between SAEs of KME 1 and KME 3 (dedicated pool - do NOT reuse kme-1-2, which is KME1<->KME2's exclusive pre-shared material)
+      // Classical HTTPS fields below are unused with transport_mode: zenoh_raft (no classical inter-KME server/client is started for KME3), kept as harmless placeholders reusing existing files
+      "inter_kme_bind_address": "localhost:14001",
+      "https_client_authentication_certificate": "certs/inter_kmes/kme1-to-kme2.pfx",
+      "https_client_authentication_certificate_password": "password",
+      "zenoh_node_id": "kme-3-zenoh" // Zenoh node_id of the other KME, used to address it directly when transport_mode is zenoh_raft
     }
   ],
   "saes": [

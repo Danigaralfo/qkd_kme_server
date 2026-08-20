@@ -86,6 +86,14 @@ impl QkdManager {
         self.key_handler.dbms_type()
     }
 
+    /// List every SAE ID currently registered in the database as belonging to this KME, for
+    /// `crate::zenoh_transport` to advertise over its Zenoh registry queryable (see
+    /// `crate::zenoh_transport::runtime`), so newly-discovered KMEs learn about this KME's SAEs
+    /// (and vice versa) without needing a static `saes` config entry anywhere else.
+    pub(crate) async fn own_sae_ids(&self) -> Vec<SaeId> {
+        self.key_handler.get_own_sae_ids().await
+    }
+
     /// Add a new QKD key to the database
     /// Increases the total entropy of all keys in the database
     /// # Arguments

@@ -11,7 +11,12 @@ pub struct ZenohTransportConfig {
     pub node_id: String,
     /// Optional local endpoint where the node will bind in the future.
     pub listen_endpoint: Option<String>,
-    /// Known peers used for bootstrap in a mesh or router deployment.
+    /// Known peers used as an optional bootstrap/fallback connection hint (e.g. to cross a
+    /// network segment multicast scouting cannot reach). With [`ZenohScoutingConfig`] enabled
+    /// (the default), nodes are *not* required to be listed here to be reachable: they are
+    /// discovered automatically via Zenoh's own multicast/gossip scouting, and traffic to them
+    /// is routed hop-by-hop through however many peers are actually connected - this list is no
+    /// longer the mechanism that makes a node reachable, just an optional shortcut/bootstrap.
     #[serde(default)]
     pub peers: Vec<String>,
     /// Optional router endpoint if the node is configured to reach a central router.
@@ -19,6 +24,11 @@ pub struct ZenohTransportConfig {
     /// Node role in the Zenoh topology.
     #[serde(default)]
     pub role: ZenohNodeRole,
+    /// Automatic peer discovery configuration (multicast + gossip scouting). See
+    /// [`ZenohScoutingConfig`] for details; this replaces the need to statically list every
+    /// other KME under `peers` for a node to be reachable.
+    #[serde(default)]
+    pub scouting: ZenohScoutingConfig,
     /// Raft cluster configuration used to replicate key-state transitions
     /// (Phase 4). See [`RaftConfig`] for details and current limitations.
     #[serde(default)]
@@ -47,9 +57,46 @@ impl Default for ZenohTransportConfig {
             peers: Vec::new(),
             router_endpoint: None,
             role: ZenohNodeRole::Peer,
+            scouting: ZenohScoutingConfig::default(),
             raft: RaftConfig::default(),
             tls: None,
             other_kme_node_ids: HashMap::new(),
+        }
+    }
+}
+
+/// Automatic peer discovery configuration for the Zenoh transport.
+///
+/// Instead of requiring every KME to be listed in every other KME's `peers` config (a
+/// pre-configured, fully-known topology), Zenoh's built-in scouting is used so a node joining
+/// the network is discovered and connected to automatically:
+/// - Multicast scouting discovers peers on the same broadcast domain (e.g. same Docker network
+///   or LAN) with no configuration needed beyond this being enabled (the default).
+/// - Gossip scouting propagates peer information through already-established links so nodes
+///   that aren't on the same multicast domain (e.g. reached only through one or more
+///   intermediate KMEs) are still discovered - this is what makes the topology-agnostic,
+///   hop-by-hop reachability requirement work even when KMEs are *not* all interconnected
+///   directly with each other. Actual message delivery hop-by-hop through however many peers are
+///   connected is handled transparently by Zenoh's own routing, once any connected path exists;
+///   no application-level relay logic is required.
+///
+/// Note: the multicast/gossip scouting beacon itself only advertises reachable locators (e.g.
+/// `tls/host:port`); it does not carry payload data. The actual Zenoh session/link is still
+/// negotiated through the configured `transport.link.tls` (mTLS remains mandatory and is
+/// unaffected by enabling scouting).
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub struct ZenohScoutingConfig {
+    /// Network interface to send/listen for multicast scouting packets on (e.g. `"eth0"`).
+    /// `None` lets Zenoh auto-select one, which is fine on a single-interface host but may need
+    /// to be set explicitly in some container/multi-NIC network setups.
+    #[serde(default)]
+    pub multicast_interface: Option<String>,
+}
+
+impl Default for ZenohScoutingConfig {
+    fn default() -> Self {
+        Self {
+            multicast_interface: None,
         }
     }
 }

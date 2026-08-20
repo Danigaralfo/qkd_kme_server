@@ -23,6 +23,7 @@ use uuid::Uuid;
 
 use super::config::ZenohTransportConfig;
 use super::contract::{ZenohEtsiExtKeysAck, ZenohEtsiExtKeysBatch, ZenohEtsiExtKeysVoid, ZenohEtsiExtKeysVoidAck, ZenohEtsiKeyMaterial, ZenohTopicMap};
+use super::registry::KmeNodeRegistry;
 
 /// How long the initiator waits for the remote KME to ack a key-material sync request.
 const SYNC_ACK_TIMEOUT: Duration = Duration::from_secs(10);
@@ -35,12 +36,17 @@ const VOID_ACK_TIMEOUT: Duration = Duration::from_secs(10);
 pub struct ZenohInterKmeTransport {
     config: ZenohTransportConfig,
     session: zenoh::Session,
+    /// Live `KmeId -> Zenoh node_id` registry, seeded from `config.other_kme_node_ids` and kept
+    /// up to date at runtime as new KMEs are discovered over Zenoh (see
+    /// `super::runtime::ZenohTransport::spawn_registry_discovery`), so a hot-plugged KME not
+    /// present in `other_kmes[]` config can still be resolved and reached.
+    kme_registry: KmeNodeRegistry,
 }
 
 impl ZenohInterKmeTransport {
     /// Create a new Zenoh-backed inter-KME transport on top of an already-open session.
-    pub fn new(config: ZenohTransportConfig, session: zenoh::Session) -> Self {
-        Self { config, session }
+    pub(crate) fn new(config: ZenohTransportConfig, session: zenoh::Session, kme_registry: KmeNodeRegistry) -> Self {
+        Self { config, session, kme_registry }
     }
 }
 
@@ -53,8 +59,8 @@ impl InterKmeTransport for ZenohInterKmeTransport {
         keys: Vec<(String, Vec<u8>)>,
     ) -> Pin<Box<dyn Future<Output = Result<(), QkdManagerResponse>> + Send + 'a>> {
         Box::pin(async move {
-            let Some(slave_node_id) = self.config.other_kme_node_ids.get(&other_kme_id) else {
-                error!("Zenoh inter-KME transport: no zenoh_node_id configured for other KME '{other_kme_id}'; add it to its `other_kmes` entry");
+            let Some(slave_node_id) = self.kme_registry.get(other_kme_id) else {
+                error!("Zenoh inter-KME transport: no zenoh_node_id known for other KME '{other_kme_id}'; add it to its `other_kmes` entry, or wait for it to be discovered over Zenoh");
                 return Err(QkdManagerResponse::RemoteKmeCommunicationError);
             };
             send_key_material_and_await_ack(
@@ -78,8 +84,8 @@ impl InterKmeTransport for ZenohInterKmeTransport {
         key_uuids: Vec<String>,
     ) -> Pin<Box<dyn Future<Output = Result<(), QkdManagerResponse>> + Send + 'a>> {
         Box::pin(async move {
-            let Some(slave_node_id) = self.config.other_kme_node_ids.get(&other_kme_id) else {
-                error!("Zenoh inter-KME transport: no zenoh_node_id configured for other KME '{other_kme_id}'; add it to its `other_kmes` entry");
+            let Some(slave_node_id) = self.kme_registry.get(other_kme_id) else {
+                error!("Zenoh inter-KME transport: no zenoh_node_id known for other KME '{other_kme_id}'; add it to its `other_kmes` entry, or wait for it to be discovered over Zenoh");
                 return Err(QkdManagerResponse::RemoteKmeCommunicationError);
             };
             send_void_request_and_await_ack(

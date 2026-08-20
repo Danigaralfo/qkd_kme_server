@@ -1102,6 +1102,43 @@ impl KeyHandler {
         Some(kme_id)
     }
 
+    /// List every SAE ID currently registered in the database as belonging to this KME.
+    ///
+    /// Used to serve this node's own Zenoh registry info (see
+    /// `crate::zenoh_transport::runtime::ZenohTransport::spawn_own_registry_queryable`), so a
+    /// newly-discovered KME's SAE ownership can be advertised to (and registered by) other KMEs
+    /// without needing a static `saes` config entry anywhere else.
+    /// # Returns
+    /// The list of SAE IDs owned by this KME (may be empty), or an empty list on a database error.
+    pub(crate) async fn get_own_sae_ids(&self) -> Vec<SaeId> {
+        const PREPARED_STATEMENT: &'static str = "SELECT sae_id FROM saes WHERE kme_id = $1;";
+        const PREPARED_STATEMENT_MYSQL: &'static str = "SELECT sae_id FROM saes WHERE kme_id = ?;";
+
+        let prepared_statement = match self.dbms_type {
+            DbmsType::MySQL => PREPARED_STATEMENT_MYSQL,
+            DbmsType::Postgres | DbmsType::Sqlite => PREPARED_STATEMENT,
+        };
+
+        let Ok(stmt) = ensure_prepared_statement_ok!(self.db, prepared_statement) else {
+            error!("Error preparing SQL statement to list own SAE IDs");
+            return Vec::new();
+        };
+        let Ok(query_args) = prepare_sql_arguments!(self.this_kme_id) else {
+            error!("Error binding parameter to list own SAE IDs");
+            return Vec::new();
+        };
+        let rows = match stmt.query_with(query_args).fetch_all(&self.db).await {
+            Ok(rows) => rows,
+            Err(e) => {
+                error!("Error executing SQL statement to list own SAE IDs: {:?}", e);
+                return Vec::new();
+            }
+        };
+        rows.iter().filter_map(|row| row.try_get::<SaeId, _>("sae_id").map_err(|e| {
+            error!("Error reading SQL statement result: {}", e);
+        }).ok()).collect()
+    }
+
     /// Directly fetch SAE info from the certificate serial number, including the SAE ID and KME ID
     /// # Arguments
     /// * `sae_certificate` - The client SAE certificate serial number

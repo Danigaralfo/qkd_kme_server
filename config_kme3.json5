@@ -1,13 +1,13 @@
 {
   "this_kme": {
-    "id": 2, // KME id over KME network
-    "db_uri": "sqlite://kme2_database.db",
+    "id": 3, // KME id over KME network
+    "db_uri": "sqlite://kme3_database.db",
     "delete_key_file_after_read": false, // Whether to delete key files after reading them (for in-memory database, set to false)
-    "key_directory_to_watch": "raw_keys/kme-2-2", // Quantum Key directory for SAEs belonging to this KME (only to be compliant with standard, as these SAEs can use public key cryptography directly)
-    "transport_mode": "https", // Startup transport mode: https or zenoh_raft
+    "key_directory_to_watch": "raw_keys/kme-3-3", // Quantum Key directory for SAEs belonging to this KME (only to be compliant with standard, as these SAEs can use public key cryptography directly)
+    "transport_mode": "zenoh_raft", // Startup transport mode: https or zenoh_raft
     "zenoh_transport": {
-      "node_id": "kme-2-zenoh",
-      "listen_endpoint": "tls/localhost:7448",
+      "node_id": "kme-3-zenoh",
+      "listen_endpoint": "tls/localhost:7449",
       // Optional bootstrap hint, not required for reachability: peers/KMEs are discovered
       // automatically via Zenoh scouting (multicast + gossip, enabled by default - see
       // ZenohScoutingConfig). Kept here because multicast scouting over loopback can be
@@ -21,17 +21,20 @@
         "private_key": "certs/inter_kmes/kme2_server.key"               // KME Zenoh node key (used for both server and client connections)
       },
       "raft": {
-        "cluster_members": ["kme-1-zenoh", "kme-2-zenoh"], // Node-ids participating in Raft consensus, including this node
+        // kme-3-zenoh deliberately NOT listed here: this node is a Raft client, not a cluster
+        // member (does not count toward quorum, is not replicated other members' proposals).
+        // leader_id must still be set so it can propose/query its own transitions with the leader.
+        "cluster_members": ["kme-1-zenoh", "kme-2-zenoh"],
         "leader_id": "kme-1-zenoh" // Statically configured Raft leader (no election yet)
       }
     },
     "saes_https_interface": {
-      "listen_address": "0.0.0.0:14000", // Listening address for connections of SAEs belonging to this KME
+      "listen_address": "0.0.0.0:15000", // Listening address for connections of SAEs belonging to this KME
       "ca_client_cert_path": "certs/kme-2-local-zone/ca.crt", // CA cert to validate SAE client certs
       "server_cert_path": "certs/kme-2-local-zone/kme_server.crt", // KME server cert for SAE connections
       "server_key_path": "certs/kme-2-local-zone/kme_server.key" // KME server key for SAE connections
     },
-    "log_level": "trace", // Optional log verbosity: error, warn, info, debug or trace (defaults to info)
+    "log_level": "info", // Optional log verbosity: error, warn, info, debug or trace (defaults to info)
     "kmes_https_interface": {
       "listen_address": "0.0.0.0:14001", // Listening address for inter-KME connections
       "ca_client_cert_path": "certs/inter_kmes/ca_kme2.crt", // CA cert to validate inter-KME client certs
@@ -42,7 +45,7 @@
   "other_kmes": [
     {
       "id": 1, // KME id of the other KME
-      "key_directory_to_watch": "raw_keys/kme-1-2", // Quantum Key directory for communication between SAEs of KME 2 and KME 1
+      "key_directory_to_watch": "raw_keys/kme-1-3", // Quantum Key directory for communication between SAEs of KME 3 and KME 1 (dedicated pool - do NOT reuse kme-1-2, which is KME1<->KME2's exclusive pre-shared material)
       "inter_kme_bind_address": "localhost:13001", // Address of the other KME to connect to
       // "ignore_system_proxy_settings" not set: default to false
       "https_client_authentication_certificate": "certs/inter_kmes/kme2-to-kme1.pfx", // Client cert to authenticate to the other KME
@@ -61,7 +64,11 @@
     },
     {
       "id": 3, // SAE id over SAE network (must be unique for each SAE across the whole network)
-      "kme_id": 2, // KME id this SAE belongs to
+      "kme_id": 2 // KME id this SAE belongs to
+    },
+    {
+      "id": 4, // SAE id over SAE network (must be unique for each SAE across the whole network)
+      "kme_id": 3, // KME id this SAE belongs to
       "https_client_certificate_serial": [ // Expected serial number of the SAE's client certificate, if SAE belongs to this KME
         0x2d,
         0x28,

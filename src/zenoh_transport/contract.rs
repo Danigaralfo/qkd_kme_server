@@ -8,7 +8,7 @@
 //! for protocol-level failures.
 
 use serde::{Deserialize, Serialize};
-use crate::SaeId;
+use crate::{KmeId, SaeId};
 
 /// Contract version used by all Zenoh payloads defined in this module.
 pub const ZENOH_CONTRACT_VERSION: &str = "1.0";
@@ -264,6 +264,21 @@ pub struct ZenohEtsiExtKeysVoidAck {
     pub reason: Option<String>,
 }
 
+/// Registry snapshot describing a KME's identity and the SAE ids it owns, served over Zenoh (see
+/// `ZenohTopicMap::kme_registry_info_topic`) so a KME can be hot-plugged into a running network
+/// (discovered via Zenoh scouting, see `crate::zenoh_transport::config::ZenohScoutingConfig`) and
+/// have its SAE ownership registered by other KMEs' live databases without appearing in their
+/// static `saes`/`other_kmes` configuration at all.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub struct ZenohKmeRegistryInfo {
+    /// This KME's numeric id (`this_kme.id` in config).
+    pub kme_id: KmeId,
+    /// This KME's Zenoh node_id.
+    pub node_id: String,
+    /// SAE ids currently registered in the database as belonging to this KME.
+    pub sae_ids: Vec<SaeId>,
+}
+
 /// Zenoh topic builders aligned with the specification.
 pub struct ZenohTopicMap;
 
@@ -327,6 +342,33 @@ impl ZenohTopicMap {
     /// shared by both the Raft and ETSI-020 planes.
     pub fn error_topic(node_id: &str) -> String {
         format!("kme/{node_id}/error")
+    }
+
+    /// Build the queryable topic where a node serves its own [`ZenohKmeRegistryInfo`].
+    pub fn kme_registry_info_topic(node_id: &str) -> String {
+        format!("kme/{node_id}/registry/info")
+    }
+
+    /// Wildcard selector matching every reachable node's [`Self::kme_registry_info_topic`], used
+    /// to discover every currently-reachable KME's identity and SAE ownership without needing to
+    /// know their node_ids ahead of time (see `crate::zenoh_transport::runtime`'s registry
+    /// discovery tasks).
+    pub fn kme_registry_info_query_selector() -> &'static str {
+        "kme/*/registry/info"
+    }
+
+    /// Build the liveliness token key expression a node declares for itself, so its presence (or
+    /// disappearance) is signalled by the Zenoh network layer itself, instead of only being
+    /// noticed on the next periodic registry poll (see
+    /// `crate::zenoh_transport::runtime::ZenohTransport::spawn_registry_discovery`).
+    pub fn kme_liveliness_topic(node_id: &str) -> String {
+        format!("kme/{node_id}/liveliness")
+    }
+
+    /// Wildcard selector matching every node's [`Self::kme_liveliness_topic`], subscribed to
+    /// (with history) to react to a KME becoming reachable/unreachable in real time.
+    pub fn kme_liveliness_query_selector() -> &'static str {
+        "kme/*/liveliness"
     }
 }
 
