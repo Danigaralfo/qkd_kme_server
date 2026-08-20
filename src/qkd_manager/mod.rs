@@ -269,6 +269,27 @@ impl QkdManager {
         Ok(EXPECTED_QKD_MANAGER_RESPONSE)
     }
 
+    /// From a remote KME, over the Zenoh transport only: store key material pushed for a master
+    /// SAE belonging to that remote KME, once this cluster's Raft view already confirmed the
+    /// `Syncing` transition for each key (see
+    /// [`crate::zenoh_transport::inter_kme_transport::ZenohInterKmeTransport`]).
+    /// # Arguments
+    /// * `origin_sae_id` - The ID of the origin (master) SAE, belonging to another KME
+    /// * `target_sae_id` - The ID of the target (slave) SAE, belonging to this KME
+    /// * `keys` - The key-id and key material pairs pushed by the remote KME
+    /// # Returns
+    /// Ok if the keys were stored successfully, an error otherwise
+    pub async fn store_synced_keys_from_remote(&self, origin_sae_id: SaeId, target_sae_id: SaeId, keys: Vec<(String, Vec<u8>)>) -> Result<QkdManagerResponse, QkdManagerResponse> {
+        const EXPECTED_QKD_MANAGER_RESPONSE: QkdManagerResponse = QkdManagerResponse::Ok;
+
+        let store_synced_keys_qkd_manager_response = self.key_handler.store_synced_keys_from_remote(origin_sae_id, target_sae_id, keys).await?;
+
+        if store_synced_keys_qkd_manager_response != EXPECTED_QKD_MANAGER_RESPONSE {
+            return Err(store_synced_keys_qkd_manager_response);
+        }
+        Ok(EXPECTED_QKD_MANAGER_RESPONSE)
+    }
+
     /// Add classical network information to a KME, used to activate keys on it for slave KMEs using "classical channel"
     /// # Arguments
     /// * `kme_id` - The ID of the KME

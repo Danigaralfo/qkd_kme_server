@@ -520,6 +520,7 @@ impl KeyHandler {
             // - other KME is authenticated (client certificate and operating system trust store)
             // - other SAE belongs to other KME (statically managed for now)
             let uuids_list = fetched_preinit_keys.iter().map(|(_, key_uuid, _)| key_uuid.clone()).collect::<Vec<_>>();
+            let keys_with_material = fetched_preinit_keys.iter().map(|(_, key_uuid, key)| (key_uuid.clone(), key.clone())).collect::<Vec<_>>();
 
             // If a Raft coordinator is configured, this KME is the master (it holds the key and
             // initiates the exchange): ask the cluster to authorize starting the sync *before*
@@ -536,7 +537,8 @@ impl KeyHandler {
                 }
             }
 
-            self.activate_keys_on_other_kme(origin_sae_id, target_kme_id, target_sae_id, uuids_list.clone()).map_err(|qkd_manager_activation_error| {
+            info!("Sending {} key(s) to KME {} for SAEs {}/{} through the installed inter-KME transport", keys_with_material.len(), target_kme_id, origin_sae_id, target_sae_id);
+            self.activate_keys_on_other_kme(origin_sae_id, target_kme_id, target_sae_id, keys_with_material).map_err(|qkd_manager_activation_error| {
                 error!("Error activating key on other KME");
                 qkd_manager_activation_error
             }).await?;
@@ -677,9 +679,49 @@ impl KeyHandler {
         Ok(QkdManagerResponse::Ok)
     }
 
-    async fn activate_keys_on_other_kme(&self, caller_master_sae_id: SaeId, other_kme_id: KmeId, other_sae_id: SaeId, key_uuids: Vec<String>) -> Result<(), QkdManagerResponse> {
+    /// From a remote KME, over the Zenoh transport only: store key material pushed directly on
+    /// the `ext_keys` plane, once this cluster's own Raft view already shows the key as
+    /// `Syncing`. Unlike [`Self::activate_key_uuids_sae`] (classical HTTPS `/keys/activate`
+    /// route), this never reads `uninit_keys`: the key bytes arrive over the wire instead of
+    /// being looked up from a locally pre-shared pool, so there is no pre-init row to consume.
+    pub(crate) async fn store_synced_keys_from_remote(&self, origin_sae_id: SaeId, target_sae_id: SaeId, keys: Vec<(String, Vec<u8>)>) -> Result<QkdManagerResponse, QkdManagerResponse> {
+        // Read-only Raft check, same rationale as `activate_key_uuids_sae`: the master already
+        // owns and drives both transitions, this KME only agrees to store once the cluster
+        // confirms it.
+        if let Some(authorizer) = self.raft_authorizer.read().await.clone() {
+            for (key_uuid, _) in &keys {
+                if authorizer.current_state(key_uuid) != Some(ZenohKeyState::Syncing) {
+                    error!("Raft cluster has not committed key {} to Syncing; refusing to store it locally", key_uuid);
+                    return Err(QkdManagerResponse::RaftConsensusRejected);
+                }
+            }
+        }
+
+        let mut transaction = self.db.begin().await.map_err(|e| {
+            error!("Error starting SQL transaction: {:?}", e);
+            QkdManagerResponse::Ko
+        })?;
+
+        for (key_uuid, key) in &keys {
+            self.insert_activated_key(key_uuid, key, origin_sae_id, target_sae_id, Some(&mut transaction)).map_err(|e| {
+                error!("Error inserting synced key: {:?}", e);
+                QkdManagerResponse::Ko
+            }).await?;
+
+            info!("Key {} synced and stored between saes {} and {}", key_uuid, origin_sae_id, target_sae_id);
+        }
+
+        transaction.commit().await.map_err(|e| {
+            error!("Error committing SQL transaction: {:?}", e);
+            QkdManagerResponse::Ko
+        })?;
+
+        Ok(QkdManagerResponse::Ok)
+    }
+
+    async fn activate_keys_on_other_kme(&self, caller_master_sae_id: SaeId, other_kme_id: KmeId, other_sae_id: SaeId, keys: Vec<(String, Vec<u8>)>) -> Result<(), QkdManagerResponse> {
         let transport = self.inter_kme_transport.read().await.clone();
-        transport.activate_key_on_remote_kme(caller_master_sae_id, other_kme_id, other_sae_id, key_uuids).await
+        transport.activate_key_on_remote_kme(caller_master_sae_id, other_kme_id, other_sae_id, keys).await
     }
 
     async fn insert_activated_key(&self, key_uuid: &str, key: &[u8], origin_sae_id: SaeId, target_sae_id: SaeId, transaction: Option<&mut Transaction<'_, Any>>)-> Result<QkdManagerResponse, QkdManagerResponse> {
@@ -1252,7 +1294,7 @@ mod tests {
         }
     }
     impl InterKmeTransport for FakeInterKmeTransport {
-        fn activate_key_on_remote_kme<'a>(&'a self, _caller_master_sae_id: SaeId, _other_kme_id: KmeId, _other_sae_id: SaeId, _key_uuids: Vec<String>) -> Pin<Box<dyn Future<Output = Result<(), QkdManagerResponse>> + Send + 'a>> {
+        fn activate_key_on_remote_kme<'a>(&'a self, _caller_master_sae_id: SaeId, _other_kme_id: KmeId, _other_sae_id: SaeId, _keys: Vec<(String, Vec<u8>)>) -> Pin<Box<dyn Future<Output = Result<(), QkdManagerResponse>> + Send + 'a>> {
             let accept = self.accept;
             Box::pin(async move {
                 if accept {

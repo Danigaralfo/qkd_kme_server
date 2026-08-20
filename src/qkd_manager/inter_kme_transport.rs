@@ -16,17 +16,20 @@ use std::pin::Pin;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 
-/// Reaches out to another KME to activate a set of already-synchronized key-ids for a given SAE
-/// pair, over whichever transport is configured. Implementations carry no key material: both
-/// KMEs already share raw QKD key material out of band, this only carries activation metadata.
+/// Reaches out to another KME to make key material available for a given SAE pair, over
+/// whichever transport is configured. The classical HTTPS implementation only ever sends the
+/// key-ids (both KMEs already share raw QKD key material out of band there); the Zenoh+Raft
+/// implementation additionally carries the key material itself over the wire (see
+/// [`crate::zenoh_transport::inter_kme_transport::ZenohInterKmeTransport`]).
 pub trait InterKmeTransport: Send + Sync {
-    /// Ask `other_kme_id` to activate `key_uuids` for the (`caller_master_sae_id`, `other_sae_id`) SAE pair.
+    /// Ask `other_kme_id` to make `keys` (key-id + key material pairs) available for the
+    /// (`caller_master_sae_id`, `other_sae_id`) SAE pair.
     fn activate_key_on_remote_kme<'a>(
         &'a self,
         caller_master_sae_id: SaeId,
         other_kme_id: KmeId,
         other_sae_id: SaeId,
-        key_uuids: Vec<String>,
+        keys: Vec<(String, Vec<u8>)>,
     ) -> Pin<Box<dyn Future<Output = Result<(), QkdManagerResponse>> + Send + 'a>>;
 
     /// Ask `other_kme_id` to void (permanently delete) `key_uuids` locally, after this KME's own
@@ -62,7 +65,7 @@ impl InterKmeTransport for HttpsInterKmeTransport {
         caller_master_sae_id: SaeId,
         other_kme_id: KmeId,
         other_sae_id: SaeId,
-        key_uuids: Vec<String>,
+        keys: Vec<(String, Vec<u8>)>,
     ) -> Pin<Box<dyn Future<Output = Result<(), QkdManagerResponse>> + Send + 'a>> {
         Box::pin(async move {
             let danger_should_ignore_remote_kme_cert = match std::env::var(crate::DANGER_IGNORE_CERTS_INTER_KME_NETWORK_ENV_VARIABLE) {
@@ -70,6 +73,7 @@ impl InterKmeTransport for HttpsInterKmeTransport {
                 Err(_) => false,
             };
 
+            let key_uuids: Vec<String> = keys.into_iter().map(|(key_uuid, _)| key_uuid).collect();
             let req_body = http_request_obj::ActivateKeyRemoteKME {
                 key_IDs_list: key_uuids,
                 origin_SAE_ID: caller_master_sae_id,

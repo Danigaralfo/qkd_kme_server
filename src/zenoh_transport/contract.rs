@@ -205,20 +205,10 @@ pub struct ZenohEtsiVersionResponse {
     pub contract_version: String,
 }
 
-/// ETSI-020 request for external keys.
-#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
-pub struct ZenohEtsiExtKeysRequest {
-    /// Unique request identifier. UUIDv4 format.
-    pub request_id: String,
-    /// Master KME that initiates the exchange.
-    pub master_kme: String,
-    /// Slave KME that receives the key material.
-    pub slave_kme: String,
-    /// Number of keys requested in this exchange.
-    pub key_count: usize,
-}
-
-/// ETSI-020 payload that carries the key material itself.
+/// ETSI-020 payload that carries the key material itself: the master KME pushes
+/// already-Raft-authorized (`Syncing`) key material directly to the slave KME, which stores it
+/// on receipt instead of activating a pre-shared local pool entry (see
+/// `zenoh_transport::inter_kme_transport`).
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 pub struct ZenohEtsiExtKeysBatch {
     /// Unique request identifier. UUIDv4 format.
@@ -227,17 +217,26 @@ pub struct ZenohEtsiExtKeysBatch {
     pub master_kme: String,
     /// Slave KME that receives the keys.
     pub slave_kme: String,
+    /// The origin (master) SAE ID the keys are being synced for.
+    pub origin_sae_id: SaeId,
+    /// The target (slave) SAE ID the keys are being synced for.
+    pub target_sae_id: SaeId,
     /// Key material carried by the message.
     pub keys: Vec<ZenohEtsiKeyMaterial>,
 }
 
-/// ETSI-020 acknowledgement for a received key batch.
+/// ETSI-020 acknowledgement for a received key batch, reporting whether the slave KME accepted
+/// and stored it (e.g. rejected if its own Raft view does not show the keys as `Syncing`).
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 pub struct ZenohEtsiExtKeysAck {
     /// Unique request identifier. UUIDv4 format.
     pub request_id: String,
     /// Number of keys acknowledged as received.
     pub received_keys: usize,
+    /// Whether the slave KME accepted and stored the key material.
+    pub accepted: bool,
+    /// Human-readable rejection reason, present when `accepted` is `false`.
+    pub reason: Option<String>,
 }
 
 /// ETSI-020 notification that an set of keys need to be voided.
@@ -260,37 +259,6 @@ pub struct ZenohEtsiExtKeysVoidAck {
     /// Unique request identifier, matching the original [`ZenohEtsiExtKeysVoid`].
     pub request_id: String,
     /// Whether the receiving KME accepted and applied the void request.
-    pub accepted: bool,
-    /// Human-readable rejection reason, present when `accepted` is `false`.
-    pub reason: Option<String>,
-}
-
-/// Request to activate a set of already QKD-synchronized key-ids on a remote (slave) KME for a
-/// given SAE pair. This is the Zenoh-transported equivalent of the classical `/keys/activate`
-/// inter-KME route (see `qkd_manager::inter_kme_transport`); it deliberately carries no key
-/// material, since both KMEs already share raw QKD key material out of band.
-#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
-pub struct ZenohActivateKeyRequest {
-    /// Unique request identifier. UUIDv4 format.
-    pub request_id: String,
-    /// Master KME that originated the activation request.
-    pub master_kme: String,
-    /// Slave KME asked to activate the keys locally.
-    pub slave_kme: String,
-    /// The origin (master) SAE ID.
-    pub origin_sae_id: SaeId,
-    /// The target (slave) SAE ID.
-    pub target_sae_id: SaeId,
-    /// The key-ids to activate.
-    pub key_ids: Vec<String>,
-}
-
-/// Acknowledgement for a [`ZenohActivateKeyRequest`], reporting whether the slave KME accepted it.
-#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
-pub struct ZenohActivateKeyAck {
-    /// Unique request identifier, matching the original [`ZenohActivateKeyRequest`].
-    pub request_id: String,
-    /// Whether the slave KME accepted and applied the activation request.
     pub accepted: bool,
     /// Human-readable rejection reason, present when `accepted` is `false`.
     pub reason: Option<String>,
@@ -330,17 +298,6 @@ impl ZenohTopicMap {
         format!("{master_node_hostname}/kmapi/ext_keys/void/ack")
     }
 
-    /// Build the pub/sub topic for key activation requests, the Zenoh equivalent of the
-    /// classical `/keys/activate` inter-KME route.
-    pub fn activate_key_topic(slave_node_hostname: &str) -> String {
-        format!("{slave_node_hostname}/kmapi/activate")
-    }
-
-    /// Build the acknowledgement topic for key activation requests.
-    pub fn activate_key_ack_topic(master_node_hostname: &str) -> String {
-        format!("{master_node_hostname}/kmapi/activate/ack")
-    }
-
     /// Build a topic for Raft presence announcements.
     pub fn raft_presence_topic(node_id: &str) -> String {
         format!("kme/{node_id}/raft/presence")
@@ -375,7 +332,7 @@ impl ZenohTopicMap {
 
 #[cfg(test)]
 mod tests {
-    use super::{ZenohActivateKeyAck, ZenohActivateKeyRequest, ZenohErrorCode, ZenohErrorResponse, ZenohEtsiExtKeysRequest, ZenohEtsiExtKeysVoid, ZenohEtsiExtKeysVoidAck, ZenohEtsiVersionQuery, ZenohEtsiVersionResponse, ZenohPlane, ZenohRaftReplicateAck, ZenohTopicMap, ZENOH_CONTRACT_VERSION};
+    use super::{ZenohErrorCode, ZenohErrorResponse, ZenohEtsiExtKeysAck, ZenohEtsiExtKeysBatch, ZenohEtsiExtKeysVoid, ZenohEtsiExtKeysVoidAck, ZenohEtsiKeyMaterial, ZenohEtsiVersionQuery, ZenohEtsiVersionResponse, ZenohPlane, ZenohRaftReplicateAck, ZenohTopicMap, ZENOH_CONTRACT_VERSION};
 
     #[test]
     fn topic_map_follows_specification() {
@@ -385,35 +342,38 @@ mod tests {
         assert_eq!(ZenohTopicMap::ext_keys_ack_topic("kme-a"), "kme-a/kmapi/ext_keys/ack");
         assert_eq!(ZenohTopicMap::ext_keys_void_topic("kme-b"), "kme-b/kmapi/ext_keys/void");
         assert_eq!(ZenohTopicMap::ext_keys_void_ack_topic("kme-a"), "kme-a/kmapi/ext_keys/void/ack");
-        assert_eq!(ZenohTopicMap::activate_key_topic("kme-b"), "kme-b/kmapi/activate");
-        assert_eq!(ZenohTopicMap::activate_key_ack_topic("kme-a"), "kme-a/kmapi/activate/ack");
         assert_eq!(ZenohTopicMap::raft_replicate_ack_topic("kme-a"), "kme/kme-a/raft/state_transition/ack");
     }
 
     #[test]
-    fn activate_key_request_and_ack_serialize_expected_fields() {
-        let request = ZenohActivateKeyRequest {
-            request_id: String::from("req-activate-1"),
+    fn ext_keys_batch_and_ack_serialize_expected_fields() {
+        let request = ZenohEtsiExtKeysBatch {
+            request_id: String::from("req-batch-1"),
             master_kme: String::from("kme-a"),
             slave_kme: String::from("kme-b"),
             origin_sae_id: 1,
             target_sae_id: 2,
-            key_ids: vec![String::from("key-1")],
+            keys: vec![ZenohEtsiKeyMaterial {
+                key_id: String::from("key-1"),
+                key_b64: String::from("a2V5LWJ5dGVz"),
+            }],
         };
-        let accepted_ack = ZenohActivateKeyAck {
-            request_id: String::from("req-activate-1"),
+        let accepted_ack = ZenohEtsiExtKeysAck {
+            request_id: String::from("req-batch-1"),
+            received_keys: 1,
             accepted: true,
             reason: None,
         };
-        let rejected_ack = ZenohActivateKeyAck {
-            request_id: String::from("req-activate-1"),
+        let rejected_ack = ZenohEtsiExtKeysAck {
+            request_id: String::from("req-batch-1"),
+            received_keys: 1,
             accepted: false,
             reason: Some(String::from("not in Syncing state")),
         };
 
         let request_json = serde_json::to_string(&request).unwrap();
-        assert!(request_json.contains("req-activate-1"));
-        assert!(request_json.contains("key-1"));
+        assert!(request_json.contains("req-batch-1"));
+        assert!(request_json.contains("a2V5LWJ5dGVz"));
 
         let accepted_json = serde_json::to_string(&accepted_ack).unwrap();
         assert!(accepted_json.contains("\"accepted\":true"));
@@ -485,20 +445,6 @@ mod tests {
         assert!(query_json.contains("kme-a"));
         assert!(response_json.contains("v1"));
         assert!(response_json.contains(ZENOH_CONTRACT_VERSION));
-    }
-
-    #[test]
-    fn etsi_ext_keys_request_serializes_key_count() {
-        let request = ZenohEtsiExtKeysRequest {
-            request_id: String::from("req-2"),
-            master_kme: String::from("kme-a"),
-            slave_kme: String::from("kme-b"),
-            key_count: 3,
-        };
-
-        let json = serde_json::to_string(&request).unwrap();
-        assert!(json.contains("req-2"));
-        assert!(json.contains("\"key_count\":3"));
     }
 
     #[test]

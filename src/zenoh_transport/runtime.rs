@@ -123,10 +123,10 @@ impl ZenohTransport {
         let persistence = persistence::RaftPersistence::new(qkd_manager.db_pool(), qkd_manager.dbms_type()).await?;
         let key_states = raft::spawn(&self.config, &session, persistence).await?;
 
-        // Real (non-demo) inter-KME wiring: service incoming activation requests, and make
+        // Real (non-demo) inter-KME wiring: service incoming key-sync requests, and make
         // outgoing ones (from qkd_manager's business logic) go out over Zenoh instead of
         // classical HTTPS.
-        inter_kme_transport::spawn_activate_key_responder(self.config.node_id.clone(), session.clone(), qkd_manager.clone()).await?;
+        inter_kme_transport::spawn_key_sync_responder(self.config.node_id.clone(), session.clone(), qkd_manager.clone()).await?;
         inter_kme_transport::spawn_void_key_responder(self.config.node_id.clone(), session.clone(), qkd_manager.clone()).await?;
         qkd_manager.set_inter_kme_transport(Arc::new(ZenohInterKmeTransport::new(self.config.clone(), session.clone()))).await;
         // Gate real cross-KME key-state transitions on this same Raft cluster, so the state
