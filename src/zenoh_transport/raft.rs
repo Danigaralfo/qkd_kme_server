@@ -630,6 +630,10 @@ async fn spawn_leader_ack_subscriber(
             match sample.payload().try_to_string() {
                 Ok(payload) => match serde_json::from_str::<ZenohRaftReplicateAck>(&payload) {
                     Ok(ack) => {
+                        info!(
+                            "Zenoh Raft leader '{}' <- received ack from follower '{}' for proposal '{}' (accepted={})",
+                            node_id, ack.follower_kme, ack.request_id, ack.accepted
+                        );
                         if !ack.accepted {
                             info!(
                                 "Zenoh Raft leader '{}': follower '{}' rejected proposal '{}' locally",

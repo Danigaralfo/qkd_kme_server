@@ -266,7 +266,10 @@ async fn send_void_request_and_await_ack(
         match sample.payload().try_to_string() {
             Ok(payload) => match serde_json::from_str::<ZenohEtsiExtKeysVoidAck>(&payload) {
                 Ok(ack) if ack.request_id != request.request_id => continue,
-                Ok(ack) if ack.accepted => return Ok(()),
+                Ok(ack) if ack.accepted => {
+                    info!("Zenoh void client '{}' <- request '{}' accepted by remote KME", own_node_id, ack.request_id);
+                    return Ok(());
+                }
                 Ok(ack) => return Err(io_err(&format!("Remote KME rejected void request: {}", ack.reason.unwrap_or_default()))),
                 Err(e) => error!("Zenoh void client '{}' <- cannot parse ack on '{ack_topic}': {e}", own_node_id),
             },
