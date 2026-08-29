@@ -30,3 +30,11 @@ CREATE TABLE IF NOT EXISTS activated_keys (
     FOREIGN KEY (target_sae_id) REFERENCES saes(sae_id),
     INDEX (id, key_uuid)
 );
+
+/* KMEs this KME has a genuine (real or simulated, via shared raw key folder) direct QKD link with,
+   durably recorded so it can be checked at runtime (ZenohRaft transport mode's multi-hop key
+   relay routing) instead of re-reading the startup configuration file. */
+CREATE TABLE IF NOT EXISTS qkd_links (
+    other_kme_id BIGINT NOT NULL,
+    PRIMARY KEY (other_kme_id)
+);

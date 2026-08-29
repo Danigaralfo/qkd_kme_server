@@ -1,7 +1,7 @@
 //! Objects deserialized from HTTP request body
 
 use serde::{Deserialize, Serialize};
-use crate::SaeId;
+use crate::{KmeId, SaeId};
 
 /// Request from the slave SAE to get key(s) from UUIDs provided by the master SAE
 #[derive(Deserialize, Debug)]
@@ -31,6 +31,15 @@ pub(crate) struct ActivateKeyRemoteKME {
     /// Master SAE that requested the key
     pub(crate) origin_SAE_ID: SaeId,
     pub(crate) remote_SAE_ID: SaeId,
+    /// Numeric id of the true final destination KME for this key material, which may differ
+    /// from the immediate receiver of this HTTPS call when it is being relayed hop-by-hop across
+    /// KMEs with no direct QKD link (`ZenohRaft` transport mode only, see
+    /// `crate::zenoh_transport::routing`). Equal to the receiver's own KME id in the classical,
+    /// non-relay case (the only case possible outside `ZenohRaft` mode).
+    pub(crate) final_target_kme_id: KmeId,
+    /// Numeric ids of every KME that has already handled this specific key material, including
+    /// the true origin, in relay order, used to avoid routing loops when computing the next hop.
+    pub(crate) visited_kme_ids: Vec<KmeId>,
 }
 
 /// From inter-KME network: a set of already-activated keys must be voided (permanently deleted) on this KME

@@ -5,7 +5,7 @@
     "db_uri": "sqlite://kme1_database.db",
     "delete_key_file_after_read": false, // Whether to delete key files after reading them (for in-memory database, set to false)
     "key_directory_to_watch": "raw_keys/kme-1-1", // Quantum Key directory for SAEs belonging to this KME (only to be compliant with standard, as these SAEs can use public key cryptography directly)
-    "transport_mode": "https", // Startup transport mode: https or zenoh_raft
+    "transport_mode": "zenoh_raft", // Startup transport mode: https or zenoh_raft
     "zenoh_transport": {
       "node_id": "kme-1-zenoh",
       "listen_endpoint": "tls/localhost:7447",
@@ -54,7 +54,7 @@
     {
       "id": 3, // KME id of the other KME
       "key_directory_to_watch": "raw_keys/kme-1-3", // Quantum Key directory for communication between SAEs of KME 1 and KME 3 (dedicated pool - do NOT reuse kme-1-2, which is KME1<->KME2's exclusive pre-shared material)
-      // Classical HTTPS fields below are unused with transport_mode: zenoh_raft (no classical inter-KME server/client is started for KME3), kept as harmless placeholders reusing existing files
+      // Classical HTTPS fields below are unused with transport_mode: zenoh_raft (no classical inter-KME server/client is started for KME3), kept as harmless s reusing existing files
       "inter_kme_bind_address": "localhost:14001",
       "https_client_authentication_certificate": "certs/inter_kmes/kme1-to-kme2.pfx",
       "https_client_authentication_certificate_password": "password",

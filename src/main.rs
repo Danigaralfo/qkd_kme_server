@@ -122,12 +122,17 @@ async fn main() {
             let mut zenoh_config = config.this_kme_config.zenoh_transport.clone().unwrap_or_default();
             zenoh_config.other_kme_node_ids = config.other_kme_zenoh_node_ids();
             // SAEs still reach their local KME over classical HTTPS (ETSI-014) regardless of the
-            // inter-KME transport, so it keeps running here; the classical inter-KME HTTPS server
-            // is not started in this mode, since Zenoh replaces that inbound channel (see
-            // `zenoh_transport::inter_kme_transport`).
+            // inter-KME transport, so it keeps running here. The classical inter-KME HTTPS
+            // server is also kept running in this mode: it is still needed to receive/relay
+            // `/keys/activate` calls for any hop that has a genuine (real or simulated) direct
+            // QKD link, even though Zenoh is used for hops that don't (see
+            // `zenoh_transport::routing` and `zenoh_transport::inter_kme_transport::HybridInterKmeTransport`).
             match &logging_http_server {
                 Some(logging_http_server) => {
                     select! {
+                        x = inter_kme_https_server.run(&qkd_manager) => {
+                            error!("Error running inter-KMEs HTTPS server: {:?}", x);
+                        },
                         x = sae_https_server.run(&qkd_manager) => {
                             error!("Error running SAEs HTTPS server: {:?}", x);
                         },
@@ -143,6 +148,9 @@ async fn main() {
                 }
                 None => {
                     select! {
+                        x = inter_kme_https_server.run(&qkd_manager) => {
+                            error!("Error running inter-KMEs HTTPS server: {:?}", x);
+                        },
                         x = sae_https_server.run(&qkd_manager) => {
                             error!("Error running SAEs HTTPS server: {:?}", x);
                         },

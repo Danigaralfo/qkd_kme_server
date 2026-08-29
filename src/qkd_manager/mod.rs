@@ -246,12 +246,17 @@ impl QkdManager {
     /// * `origin_sae_id` - The ID of the origin (master) SAE, belonging to another KME
     /// * `target_sae_id` - The ID of the target (slave) SAE, to which master SAE wants to communicate, belonging to this KME
     /// * `key_uuid` - The UUID of the key to activate
+    /// * `final_target_kme_id` - The true final destination KME for this key material; equal to
+    ///   this KME's own id in the classical, non-relay case (the only case possible outside
+    ///   `ZenohRaft` mode)
+    /// * `visited_kme_ids` - Every KME that already handled this key material before this one,
+    ///   including the true origin, used to avoid routing loops if it must be relayed onward
     /// # Returns
     /// Ok if the key was activated successfully, an error otherwise
-    pub async fn activate_key_from_remote(&self, origin_sae_id: SaeId, target_sae_id: SaeId, key_uuids_list: Vec<String>) -> Result<QkdManagerResponse, QkdManagerResponse> {
+    pub async fn activate_key_from_remote(&self, origin_sae_id: SaeId, target_sae_id: SaeId, key_uuids_list: Vec<String>, final_target_kme_id: KmeId, visited_kme_ids: Vec<KmeId>) -> Result<QkdManagerResponse, QkdManagerResponse> {
         const EXPECTED_QKD_MANAGER_RESPONSE: QkdManagerResponse = QkdManagerResponse::Ok;
 
-        let activate_key_uuid_qkd_manager_response = self.key_handler.activate_key_uuids_sae(origin_sae_id, target_sae_id, key_uuids_list).await?;
+        let activate_key_uuid_qkd_manager_response = self.key_handler.activate_key_uuids_sae(origin_sae_id, target_sae_id, key_uuids_list, final_target_kme_id, visited_kme_ids).await?;
 
         if activate_key_uuid_qkd_manager_response != EXPECTED_QKD_MANAGER_RESPONSE {
             return Err(activate_key_uuid_qkd_manager_response);
@@ -285,12 +290,15 @@ impl QkdManager {
     /// * `origin_sae_id` - The ID of the origin (master) SAE, belonging to another KME
     /// * `target_sae_id` - The ID of the target (slave) SAE, belonging to this KME
     /// * `keys` - The key-id and key material pairs pushed by the remote KME
+    /// * `final_target_kme_id` - The true final destination KME for this key material
+    /// * `visited_kme_ids` - Every KME that already handled this key material before this one,
+    ///   including the true origin, used to avoid routing loops if it must be relayed onward
     /// # Returns
     /// Ok if the keys were stored successfully, an error otherwise
-    pub async fn store_synced_keys_from_remote(&self, origin_sae_id: SaeId, target_sae_id: SaeId, keys: Vec<(String, Vec<u8>)>) -> Result<QkdManagerResponse, QkdManagerResponse> {
+    pub async fn store_synced_keys_from_remote(&self, origin_sae_id: SaeId, target_sae_id: SaeId, keys: Vec<(String, Vec<u8>)>, final_target_kme_id: KmeId, visited_kme_ids: Vec<KmeId>) -> Result<QkdManagerResponse, QkdManagerResponse> {
         const EXPECTED_QKD_MANAGER_RESPONSE: QkdManagerResponse = QkdManagerResponse::Ok;
 
-        let store_synced_keys_qkd_manager_response = self.key_handler.store_synced_keys_from_remote(origin_sae_id, target_sae_id, keys).await?;
+        let store_synced_keys_qkd_manager_response = self.key_handler.store_synced_keys_from_remote(origin_sae_id, target_sae_id, keys, final_target_kme_id, visited_kme_ids).await?;
 
         if store_synced_keys_qkd_manager_response != EXPECTED_QKD_MANAGER_RESPONSE {
             return Err(store_synced_keys_qkd_manager_response);
@@ -361,6 +369,46 @@ impl QkdManager {
     /// * `transport` - The inter-KME transport to use from now on
     pub async fn set_inter_kme_transport(&self, transport: Arc<dyn inter_kme_transport::InterKmeTransport>) {
         self.key_handler.set_inter_kme_transport(transport).await
+    }
+
+    /// The transport currently installed to activate keys on other KMEs (defaults to classical
+    /// HTTPS). Used by `crate::zenoh_transport::runtime` to capture it before overwriting it with
+    /// a hybrid classical/Zenoh transport in `ZenohRaft` mode.
+    pub(crate) async fn current_inter_kme_transport(&self) -> Arc<dyn inter_kme_transport::InterKmeTransport> {
+        self.key_handler.current_inter_kme_transport().await
+    }
+
+    /// Set (or replace) the resolver used to compute the next hop toward a key's true final
+    /// destination KME, for multi-hop relay across KMEs with no direct QKD link. Optional and
+    /// backward-compatible: as long as this is never called, this QKD manager never relays (a
+    /// direct link to the target KME is always required).
+    /// # Arguments
+    /// * `resolver` - The routing resolver to consult from now on
+    pub async fn set_key_routing_resolver(&self, resolver: Arc<dyn crate::zenoh_transport::routing::KeyRoutingResolver>) {
+        self.key_handler.set_key_routing_resolver(resolver).await
+    }
+
+    /// Shared, thread-safe `KmeId -> directory` map for every KME this KME has a genuine QKD
+    /// link with (see [`Self::add_qkd_link`]), for `crate::zenoh_transport::runtime` to build a
+    /// hybrid classical/Zenoh transport.
+    pub(crate) fn qkd_link_directories(&self) -> Arc<tokio::sync::RwLock<std::collections::HashMap<KmeId, String>>> {
+        self.key_handler.qkd_link_directories()
+    }
+
+    /// Record that this KME has a genuine (real or simulated, via a shared raw key folder)
+    /// direct QKD link with `other_kme_id`, durably in the database, and remember `directory`
+    /// (the shared folder watched for that link).
+    /// # Arguments
+    /// * `other_kme_id` - The other KME this KME has a direct QKD link with
+    /// * `directory` - The shared raw key directory watched for that link
+    pub async fn add_qkd_link(&self, other_kme_id: KmeId, directory: &str) -> Result<QkdManagerResponse, QkdManagerResponse> {
+        self.key_handler.add_qkd_link(other_kme_id, directory).await
+    }
+
+    /// Every KME this KME has a genuine direct QKD link with (see [`Self::add_qkd_link`]), for
+    /// `crate::zenoh_transport::runtime` to advertise over its Zenoh registry queryable.
+    pub(crate) async fn list_qkd_linked_kme_ids(&self) -> Vec<KmeId> {
+        self.key_handler.list_qkd_linked_kme_ids().await
     }
 }
 

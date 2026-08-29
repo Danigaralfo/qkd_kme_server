@@ -52,7 +52,9 @@ impl InterKMEsRoutes {
         let response = qkd_manager.activate_key_from_remote(
             key_to_activate_obj.origin_SAE_ID,
             key_to_activate_obj.remote_SAE_ID,
-            key_to_activate_obj.key_IDs_list).await;
+            key_to_activate_obj.key_IDs_list,
+            key_to_activate_obj.final_target_kme_id,
+            key_to_activate_obj.visited_kme_ids).await;
         match response {
             Ok(_) => Ok(Response::builder().status(StatusCode::OK).body(Full::new(Bytes::from(String::from("OK")))).unwrap()),
             Err(_) => Ok(Response::builder().status(StatusCode::BAD_REQUEST).body(Full::new(Bytes::from(String::from("Cannot activate key")))).unwrap())

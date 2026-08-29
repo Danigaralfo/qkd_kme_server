@@ -16,6 +16,8 @@ pub(crate) mod persistence;
 /// Live, shared `KmeId -> Zenoh node_id` registry, updated at runtime as new KMEs are discovered
 /// over Zenoh (hot-plug support), see `registry::KmeNodeRegistry`.
 pub(crate) mod registry;
+/// Multi-hop key relay routing (`ZenohRaft` transport mode only), see `routing::compute_next_hop`.
+pub mod routing;
 pub mod runtime;
 
 pub use runtime::ZenohTransport;

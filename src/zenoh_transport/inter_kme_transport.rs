@@ -15,10 +15,13 @@ use crate::qkd_manager::{QkdManager, QkdManagerResponse};
 use crate::{KmeId, SaeId};
 use base64::{engine::general_purpose, Engine as _};
 use log::{error, info};
+use std::collections::HashMap;
 use std::future::Future;
 use std::io;
 use std::pin::Pin;
+use std::sync::Arc;
 use std::time::Duration;
+use tokio::sync::RwLock;
 use uuid::Uuid;
 
 use super::config::ZenohTransportConfig;
@@ -57,6 +60,8 @@ impl InterKmeTransport for ZenohInterKmeTransport {
         other_kme_id: KmeId,
         other_sae_id: SaeId,
         keys: Vec<(String, Vec<u8>)>,
+        final_target_kme_id: KmeId,
+        visited_kme_ids: Vec<KmeId>,
     ) -> Pin<Box<dyn Future<Output = Result<(), QkdManagerResponse>> + Send + 'a>> {
         Box::pin(async move {
             let Some(slave_node_id) = self.kme_registry.get(other_kme_id) else {
@@ -70,6 +75,8 @@ impl InterKmeTransport for ZenohInterKmeTransport {
                 caller_master_sae_id,
                 other_sae_id,
                 keys,
+                final_target_kme_id,
+                visited_kme_ids,
                 SYNC_ACK_TIMEOUT,
             ).await.map_err(|e| {
                 error!("Zenoh inter-KME transport: key sync request to '{}' failed: {e}", slave_node_id);
@@ -111,6 +118,8 @@ async fn send_key_material_and_await_ack(
     origin_sae_id: SaeId,
     target_sae_id: SaeId,
     keys: Vec<(String, Vec<u8>)>,
+    final_target_kme_id: KmeId,
+    visited_kme_ids: Vec<KmeId>,
     timeout: Duration,
 ) -> Result<(), io::Error> {
     // Subscribe to our own ack topic *before* publishing the request, so a fast responder can
@@ -131,6 +140,8 @@ async fn send_key_material_and_await_ack(
             key_id,
             key_b64: general_purpose::STANDARD.encode(key_bytes),
         }).collect(),
+        final_target_kme_id,
+        visited_kme_ids,
     };
     let request_topic = ZenohTopicMap::ext_keys_topic(remote_node_id);
     info!(
@@ -190,7 +201,7 @@ pub(super) async fn spawn_key_sync_responder(node_id: String, session: zenoh::Se
                             .map(|k| general_purpose::STANDARD.decode(&k.key_b64).ok().map(|bytes| (k.key_id.clone(), bytes)))
                             .collect();
                         let result = match decoded_keys {
-                            Some(keys) => qkd_manager.store_synced_keys_from_remote(request.origin_sae_id, request.target_sae_id, keys).await,
+                            Some(keys) => qkd_manager.store_synced_keys_from_remote(request.origin_sae_id, request.target_sae_id, keys, request.final_target_kme_id, request.visited_kme_ids.clone()).await,
                             None => {
                                 error!("Zenoh ext_keys responder '{}': malformed base64 key material in request '{}'", node_id, request.request_id);
                                 Err(QkdManagerResponse::Ko)
@@ -317,4 +328,65 @@ pub(super) async fn spawn_void_key_responder(node_id: String, session: zenoh::Se
     });
 
     Ok(())
+}
+
+/// Installed in place of a plain [`ZenohInterKmeTransport`] once `transport_mode: ZenohRaft` is
+/// configured (see `super::runtime::ZenohTransport::run`): dispatches each `activate` call to
+/// whichever transport matches that specific hop, so multi-hop key relay routing (see
+/// [`crate::zenoh_transport::routing`]) can freely mix classical HTTPS hops (where a genuine QKD
+/// link exists) and Zenoh hops (where it doesn't) within a single relay chain. `void` requests
+/// are always sent over Zenoh, unaffected by this feature (see the module documentation).
+pub(crate) struct HybridInterKmeTransport {
+    /// The classical HTTPS transport, used for any hop where this KME has a genuine (real or
+    /// simulated) direct QKD link with the next hop.
+    https_transport: Arc<dyn InterKmeTransport>,
+    /// The Zenoh transport, used for any hop where this KME has no direct QKD link with the next
+    /// hop, and for all `void` requests.
+    zenoh_transport: Arc<ZenohInterKmeTransport>,
+    /// Shared `KmeId -> directory` map for every KME this KME has a genuine QKD link with (see
+    /// [`crate::qkd_manager::key_handler::KeyHandler::add_qkd_link`]), consulted to decide which
+    /// transport to use for a given next hop.
+    qkd_link_directories: Arc<RwLock<HashMap<KmeId, String>>>,
+}
+
+impl HybridInterKmeTransport {
+    /// Build a hybrid transport dispatching between `https_transport` (used for QKD-linked hops)
+    /// and `zenoh_transport` (used otherwise), consulting `qkd_link_directories` to decide.
+    pub(crate) fn new(
+        https_transport: Arc<dyn InterKmeTransport>,
+        zenoh_transport: Arc<ZenohInterKmeTransport>,
+        qkd_link_directories: Arc<RwLock<HashMap<KmeId, String>>>,
+    ) -> Self {
+        Self { https_transport, zenoh_transport, qkd_link_directories }
+    }
+}
+
+impl InterKmeTransport for HybridInterKmeTransport {
+    fn activate_key_on_remote_kme<'a>(
+        &'a self,
+        caller_master_sae_id: SaeId,
+        other_kme_id: KmeId,
+        other_sae_id: SaeId,
+        keys: Vec<(String, Vec<u8>)>,
+        final_target_kme_id: KmeId,
+        visited_kme_ids: Vec<KmeId>,
+    ) -> Pin<Box<dyn Future<Output = Result<(), QkdManagerResponse>> + Send + 'a>> {
+        Box::pin(async move {
+            let has_qkd_link = self.qkd_link_directories.read().await.contains_key(&other_kme_id);
+            if has_qkd_link {
+                self.https_transport.activate_key_on_remote_kme(caller_master_sae_id, other_kme_id, other_sae_id, keys, final_target_kme_id, visited_kme_ids).await
+            } else {
+                self.zenoh_transport.activate_key_on_remote_kme(caller_master_sae_id, other_kme_id, other_sae_id, keys, final_target_kme_id, visited_kme_ids).await
+            }
+        })
+    }
+
+    fn void_keys_on_remote_kme<'a>(
+        &'a self,
+        other_kme_id: KmeId,
+        key_uuids: Vec<String>,
+    ) -> Pin<Box<dyn Future<Output = Result<(), QkdManagerResponse>> + Send + 'a>> {
+        // `void_keys` stays pure Zenoh, unaffected by this feature (see the module documentation).
+        self.zenoh_transport.void_keys_on_remote_kme(other_kme_id, key_uuids)
+    }
 }

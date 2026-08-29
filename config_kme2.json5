@@ -4,7 +4,7 @@
     "db_uri": "sqlite://kme2_database.db",
     "delete_key_file_after_read": false, // Whether to delete key files after reading them (for in-memory database, set to false)
     "key_directory_to_watch": "raw_keys/kme-2-2", // Quantum Key directory for SAEs belonging to this KME (only to be compliant with standard, as these SAEs can use public key cryptography directly)
-    "transport_mode": "https", // Startup transport mode: https or zenoh_raft
+    "transport_mode": "zenoh_raft", // Startup transport mode: https or zenoh_raft
     "zenoh_transport": {
       "node_id": "kme-2-zenoh",
       "listen_endpoint": "tls/localhost:7448",

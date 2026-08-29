@@ -148,10 +148,18 @@ impl<T: crate::routes::Routes> AuthHttpsServer<T> {
         // Trusted CA for client certificates
         let mut roots = RootCertStore::empty();
         let ca_cert_binding = load_cert(self.ca_client_cert_path.as_str())?;
-        let ca_cert = ca_cert_binding.first().ok_or(io_err("Invalid client CA certificate file"))?;
-        roots.add(ca_cert.clone()).map_err(|_| {
-            io_err("Error adding CA certificate")
-        })?;
+        if ca_cert_binding.is_empty() {
+            return Err(io_err("Invalid client CA certificate file"));
+        }
+        // `ca_client_cert_path` may be a bundle of several CAs concatenated (e.g. one KME
+        // trusting client certs signed by any of several peers' own CAs) - trust all of them,
+        // not just the first, otherwise `WebPkiClientVerifier` only advertises (and accepts)
+        // the first CA in the file, silently rejecting valid client certs signed by any other.
+        for ca_cert in &ca_cert_binding {
+            roots.add(ca_cert.clone()).map_err(|_| {
+                io_err("Error adding CA certificate")
+            })?;
+        }
         let client_verifier = WebPkiClientVerifier::builder(roots.into()).build().map_err(|_| {
             io_err("Error building client verifier")
         })?;

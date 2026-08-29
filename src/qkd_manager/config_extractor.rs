@@ -24,6 +24,12 @@ impl ConfigExtractor {
         for other_kme_config in &config.other_kme_configs {
             let kme_id = other_kme_config.id;
             let kme_keys_dir = other_kme_config.key_directory_to_watch.as_str();
+            // Every `other_kmes[]` entry represents a genuine (real or simulated) direct QKD
+            // link: record it durably so `ZenohRaft` mode's multi-hop key relay routing can check
+            // it at runtime (see `QkdManager::add_qkd_link`), without requiring a direct link to
+            // the *final* destination KME.
+            qkd_manager.add_qkd_link(kme_id, kme_keys_dir).await
+                .map_err(|e| io_err(&format!("Cannot record QKD link: {:?}", e)))?;
             Self::extract_and_watch_raw_keys_dir(Arc::clone(&qkd_manager), kme_id, kme_keys_dir, config.this_kme_config.delete_key_file_after_read).await?;
         }
         Self::extract_and_watch_raw_keys_dir(

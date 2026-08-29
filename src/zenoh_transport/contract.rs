@@ -223,6 +223,16 @@ pub struct ZenohEtsiExtKeysBatch {
     pub target_sae_id: SaeId,
     /// Key material carried by the message.
     pub keys: Vec<ZenohEtsiKeyMaterial>,
+    /// Numeric id of the true final destination KME for this key material, which may differ
+    /// from `slave_kme` (the immediate next hop) when this batch is being relayed hop-by-hop
+    /// across KMEs with no direct QKD link (see `crate::zenoh_transport::routing`). The receiving
+    /// KME stores the keys locally if it is the final destination, or relays them onward
+    /// otherwise.
+    pub final_target_kme_id: KmeId,
+    /// Numeric ids of every KME that has already handled this specific key material, including
+    /// the true origin, in relay order, used to avoid routing loops when computing the next hop.
+    #[serde(default)]
+    pub visited_kme_ids: Vec<KmeId>,
 }
 
 /// ETSI-020 acknowledgement for a received key batch, reporting whether the slave KME accepted
@@ -277,6 +287,12 @@ pub struct ZenohKmeRegistryInfo {
     pub node_id: String,
     /// SAE ids currently registered in the database as belonging to this KME.
     pub sae_ids: Vec<SaeId>,
+    /// KMEs this KME has a genuine (real or simulated) direct QKD link with (see
+    /// `crate::qkd_manager::QkdManager::add_qkd_link`), so every node can build the full
+    /// QKD-adjacency graph locally and compute multi-hop key relay routes toward KMEs it has no
+    /// direct link with (see `crate::zenoh_transport::routing`).
+    #[serde(default)]
+    pub qkd_linked_kme_ids: Vec<KmeId>,
 }
 
 /// Zenoh topic builders aligned with the specification.
@@ -399,6 +415,8 @@ mod tests {
                 key_id: String::from("key-1"),
                 key_b64: String::from("a2V5LWJ5dGVz"),
             }],
+            final_target_kme_id: 2,
+            visited_kme_ids: vec![1],
         };
         let accepted_ack = ZenohEtsiExtKeysAck {
             request_id: String::from("req-batch-1"),

@@ -28,3 +28,10 @@ CREATE TABLE IF NOT EXISTS activated_keys (
 );
 
 CREATE INDEX IF NOT EXISTS idx_keys_id_keyuuid ON activated_keys(id, key_uuid);
+
+/* KMEs this KME has a genuine (real or simulated, via shared raw key folder) direct QKD link with,
+   durably recorded so it can be checked at runtime (ZenohRaft transport mode's multi-hop key
+   relay routing) instead of re-reading the startup configuration file. */
+CREATE TABLE IF NOT EXISTS qkd_links (
+    other_kme_id BIGINT PRIMARY KEY NOT NULL
+);

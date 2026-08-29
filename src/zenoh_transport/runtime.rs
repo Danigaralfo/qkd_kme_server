@@ -16,11 +16,12 @@ use std::time::Duration;
 use uuid::Uuid;
 
 use super::contract::{ZenohEtsiVersionResponse, ZenohKmeRegistryInfo, ZenohTopicMap, ZENOH_CONTRACT_VERSION};
-use super::inter_kme_transport::{self, ZenohInterKmeTransport};
+use super::inter_kme_transport::{self, HybridInterKmeTransport, ZenohInterKmeTransport};
 use super::messages::ZenohEnvelope;
 use super::persistence;
 use super::raft;
 use super::registry::KmeNodeRegistry;
+use super::routing::ZenohKeyRouter;
 use super::config::ZenohTransportConfig;
 use zenoh::sample::{Sample, SampleKind};
 
@@ -154,6 +155,26 @@ impl ZenohTransport {
         // newly-joined KME's SAE ownership (and vice versa) without needing a static
         // `other_kmes`/`saes` config entry anywhere, and without waiting on a fixed poll delay.
         let kme_registry = KmeNodeRegistry::new(self.config.other_kme_node_ids.clone());
+        // Self-seed this node's own entry immediately, so its own QKD adjacency is available to
+        // routing decisions (see `crate::zenoh_transport::routing`) without waiting on a round
+        // trip through discovery for what this node already knows about itself.
+        kme_registry.upsert(qkd_manager.kme_id, self.config.node_id.clone(), qkd_manager.list_qkd_linked_kme_ids().await);
+
+        // Install the hybrid classical/Zenoh transport and the multi-hop routing resolver as
+        // early as possible - right after the session and registry are ready, and deliberately
+        // BEFORE the slower setup below (registry queryable, liveliness, discovery, persistence,
+        // Raft). The SAE-facing HTTPS server is started concurrently with this whole `run()` (see
+        // `main.rs`), so any `enc_keys` request arriving while later steps are still in progress
+        // must already see a real routing resolver installed - otherwise `KeyHandler::get_sae_keys`
+        // silently falls back to treating the final-destination KME as directly reachable (no
+        // resolver installed yet), pulling from the wrong local key pool and failing with "No key
+        // available" even though a valid multi-hop route exists.
+        let default_https_transport = qkd_manager.current_inter_kme_transport().await;
+        let zenoh_transport = ZenohInterKmeTransport::new(self.config.clone(), session.clone(), kme_registry.clone());
+        let hybrid_transport = HybridInterKmeTransport::new(default_https_transport, Arc::new(zenoh_transport), qkd_manager.qkd_link_directories());
+        qkd_manager.set_inter_kme_transport(Arc::new(hybrid_transport)).await;
+        qkd_manager.set_key_routing_resolver(Arc::new(ZenohKeyRouter::new(qkd_manager.kme_id, kme_registry.clone()))).await;
+
         self.spawn_own_registry_queryable(&session, &qkd_manager).await?;
         // Kept alive for the process lifetime: dropping it would undeclare our own presence.
         let own_liveliness_topic = ZenohTopicMap::kme_liveliness_topic(self.config.node_id.as_str());
@@ -163,7 +184,7 @@ impl ZenohTransport {
             .await
             .map_err(|e| io_err(&format!("Cannot declare Zenoh liveliness token: {e}")))?;
         info!("Zenoh liveliness token declared on '{}': this node is now visible to other KMEs' registry discovery", own_liveliness_topic);
-        self.spawn_registry_discovery(session.clone(), qkd_manager.clone(), kme_registry.clone()).await?;
+        self.spawn_registry_discovery(session.clone(), qkd_manager.clone(), kme_registry).await?;
         // Phase 7: durably persist Raft-lite key states/commits in this KME's own database
         // (reusing `qkd_manager`'s existing connection pool) so consensus survives a restart.
         let persistence = persistence::RaftPersistence::new(qkd_manager.db_pool(), qkd_manager.dbms_type()).await?;
@@ -174,7 +195,6 @@ impl ZenohTransport {
         // classical HTTPS.
         inter_kme_transport::spawn_key_sync_responder(self.config.node_id.clone(), session.clone(), qkd_manager.clone()).await?;
         inter_kme_transport::spawn_void_key_responder(self.config.node_id.clone(), session.clone(), qkd_manager.clone()).await?;
-        qkd_manager.set_inter_kme_transport(Arc::new(ZenohInterKmeTransport::new(self.config.clone(), session.clone(), kme_registry))).await;
         // Gate real cross-KME key-state transitions on this same Raft cluster, so the state
         // machine built in Phase 5 is actually enforced for real SAE traffic.
         qkd_manager.set_raft_authorizer(Arc::new(raft::RaftKeyCoordinator::new(self.config.clone(), session.clone(), key_states))).await;
@@ -248,6 +268,7 @@ impl ZenohTransport {
                     kme_id,
                     node_id: node_id.clone(),
                     sae_ids: qkd_manager.own_sae_ids().await,
+                    qkd_linked_kme_ids: qkd_manager.list_qkd_linked_kme_ids().await,
                 };
                 match serde_json::to_string(&response) {
                     Ok(payload) => {
@@ -416,7 +437,7 @@ impl ZenohTransport {
             return; // Our own reply to our own wildcard query.
         }
 
-        if kme_registry.upsert(info.kme_id, info.node_id.clone()) {
+        if kme_registry.upsert(info.kme_id, info.node_id.clone(), info.qkd_linked_kme_ids.clone()) {
             info!(
                 "Zenoh registry discovery: discovered KME {} (node '{}', {} SAE(s)); registering locally",
                 info.kme_id, info.node_id, info.sae_ids.len()

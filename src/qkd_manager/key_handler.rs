@@ -67,7 +67,17 @@ pub(crate) struct KeyHandler {
     raft_authorizer: Arc<RwLock<Option<Arc<dyn KeyLifecycleAuthorizer>>>>,
     /// Transport used to activate keys on other KMEs (see [`Self::set_inter_kme_transport`]);
     /// defaults to classical HTTPS, unchanged from before this abstraction existed
-    inter_kme_transport: Arc<RwLock<Arc<dyn InterKmeTransport>>>
+    inter_kme_transport: Arc<RwLock<Arc<dyn InterKmeTransport>>>,
+    /// In-memory `KmeId -> shared key directory` map for every KME this KME has a genuine QKD
+    /// link with (see [`Self::add_qkd_link`]). Used only in `ZenohRaft` transport mode, to know
+    /// where to write a relayed key's raw bytes so the peer's own file watcher picks it up as if
+    /// it had come from a real QKD link (see [`crate::qkd_manager::inter_kme_transport::HttpsInterKmeTransport`]).
+    qkd_link_directories: Arc<RwLock<std::collections::HashMap<KmeId, String>>>,
+    /// Optional resolver computing the next hop toward a key's true final destination KME, for
+    /// multi-hop relay across KMEs with no direct QKD link (see [`Self::set_key_routing_resolver`]);
+    /// `None` means no relay is possible (classical HTTPS mode, or `ZenohRaft` before this is
+    /// installed), matching today's behavior of requiring a direct link to `target_kme_id`.
+    key_routing_resolver: Arc<RwLock<Option<Arc<dyn crate::zenoh_transport::routing::KeyRoutingResolver>>>>,
 }
 
 impl KeyHandler {
@@ -117,7 +127,8 @@ impl KeyHandler {
 
         let qkd_router = Arc::new(RwLock::new(router::QkdRouter::new()));
         let other_kme_connections_cache = Arc::new(RwLock::new(HashMap::new()));
-        let inter_kme_transport: Arc<dyn InterKmeTransport> = Arc::new(HttpsInterKmeTransport::new(qkd_router.clone(), other_kme_connections_cache));
+        let qkd_link_directories = Arc::new(RwLock::new(std::collections::HashMap::new()));
+        let inter_kme_transport: Arc<dyn InterKmeTransport> = Arc::new(HttpsInterKmeTransport::new(qkd_router.clone(), other_kme_connections_cache, qkd_link_directories.clone()));
 
         let key_handler = Self {
             db: dbpool,
@@ -128,7 +139,9 @@ impl KeyHandler {
             nickname: kme_nickname,
             blocked_key_ids: Arc::new(Mutex::new(HashSet::with_capacity(8 * crate::MAX_QKD_KEYS_PER_REQUEST))),
             raft_authorizer: Arc::new(RwLock::new(None)),
-            inter_kme_transport: Arc::new(RwLock::new(inter_kme_transport))
+            inter_kme_transport: Arc::new(RwLock::new(inter_kme_transport)),
+            qkd_link_directories,
+            key_routing_resolver: Arc::new(RwLock::new(None)),
         };
         // Create the tables if they do not exist
         key_handler.db.execute(database_initialization_req).await.map_err(|e| {
@@ -203,6 +216,79 @@ impl KeyHandler {
     /// * `transport` - The inter-KME transport to use from now on
     pub(crate) async fn set_inter_kme_transport(&self, transport: Arc<dyn InterKmeTransport>) {
         *self.inter_kme_transport.write().await = transport;
+    }
+
+    /// The transport currently installed to activate keys on other KMEs (defaults to classical
+    /// HTTPS, see [`Self::new`]). Used by `zenoh_transport::runtime` to capture the default
+    /// HTTPS transport before overwriting it with a hybrid classical/Zenoh transport in
+    /// `ZenohRaft` mode (see [`Self::set_inter_kme_transport`]).
+    pub(crate) async fn current_inter_kme_transport(&self) -> Arc<dyn InterKmeTransport> {
+        self.inter_kme_transport.read().await.clone()
+    }
+
+    /// Set (or replace) the resolver used to compute the next hop toward a key's true final
+    /// destination KME, for multi-hop relay across KMEs with no direct QKD link (see
+    /// `get_sae_keys` and `relay_or_store_keys`). Optional and backward-compatible: as long as
+    /// this is never called, this KME never relays (a direct link to `target_kme_id` is always
+    /// required, matching behavior before this feature existed).
+    /// # Arguments
+    /// * `resolver` - The routing resolver to consult from now on
+    pub(crate) async fn set_key_routing_resolver(&self, resolver: Arc<dyn crate::zenoh_transport::routing::KeyRoutingResolver>) {
+        *self.key_routing_resolver.write().await = Some(resolver);
+    }
+
+    /// Shared, thread-safe `KmeId -> directory` map for every KME this KME has a genuine QKD
+    /// link with (see [`Self::add_qkd_link`]), for `zenoh_transport::runtime` to build a hybrid
+    /// classical/Zenoh transport that can tell, for a given next hop, whether a QKD link exists.
+    pub(crate) fn qkd_link_directories(&self) -> Arc<RwLock<std::collections::HashMap<KmeId, String>>> {
+        self.qkd_link_directories.clone()
+    }
+
+    /// Record that this KME has a genuine (real or simulated, via a shared raw key folder)
+    /// direct QKD link with `other_kme_id`, durably in the database (idempotent: calling this
+    /// again for an already-recorded `other_kme_id` is a no-op), and remember `directory` (the
+    /// shared folder watched for that link) in memory for [`Self::qkd_link_directory`].
+    /// # Arguments
+    /// * `other_kme_id` - The other KME this KME has a direct QKD link with
+    /// * `directory` - The shared raw key directory watched for that link
+    pub(crate) async fn add_qkd_link(&self, other_kme_id: KmeId, directory: &str) -> Result<QkdManagerResponse, QkdManagerResponse> {
+        const PREPARED_STATEMENT_SQLITE_POSTGRES: &'static str = "INSERT INTO qkd_links (other_kme_id) VALUES ($1) ON CONFLICT (other_kme_id) DO NOTHING;";
+        const PREPARED_STATEMENT_MYSQL: &'static str = "INSERT IGNORE INTO qkd_links (other_kme_id) VALUES (?);";
+
+        let prepared_statement = match self.dbms_type {
+            DbmsType::MySQL => PREPARED_STATEMENT_MYSQL,
+            DbmsType::Postgres | DbmsType::Sqlite => PREPARED_STATEMENT_SQLITE_POSTGRES,
+        };
+
+        let stmt = ensure_prepared_statement_ok!(self.db, prepared_statement)?;
+        let query_args = prepare_sql_arguments!(other_kme_id)?;
+        stmt.query_with(query_args).execute(&self.db).await.map_err(|e| {
+            error!("Error executing SQL statement: {:?}", e);
+            QkdManagerResponse::Ko
+        })?;
+
+        self.qkd_link_directories.write().await.insert(other_kme_id, directory.to_string());
+        Ok(QkdManagerResponse::Ok)
+    }
+
+    /// Every KME this KME has a genuine direct QKD link with (see [`Self::add_qkd_link`]), for
+    /// `zenoh_transport::runtime` to advertise over its Zenoh registry queryable so other KMEs
+    /// can build the QKD-adjacency graph used for multi-hop relay routing.
+    pub(crate) async fn list_qkd_linked_kme_ids(&self) -> Vec<KmeId> {
+        const PREPARED_STATEMENT: &'static str = "SELECT other_kme_id FROM qkd_links;";
+
+        let stmt = match ensure_prepared_statement_ok!(self.db, PREPARED_STATEMENT) {
+            Ok(stmt) => stmt,
+            Err(_) => return vec![],
+        };
+        let rows = match stmt.query().fetch_all(&self.db).await {
+            Ok(rows) => rows,
+            Err(e) => {
+                error!("Error executing SQL statement: {:?}", e);
+                return vec![];
+            }
+        };
+        rows.iter().filter_map(|row| row.try_get::<KmeId, _>("other_kme_id").ok()).collect()
     }
 
     /// Add a new SAE ID to the database
@@ -423,13 +509,42 @@ impl KeyHandler {
         let origin_kme_id = self.this_kme_id;
         let target_kme_id = self.get_kme_id_from_sae_id(target_sae_id).await.ok_or(QkdManagerResponse::NotFound)?;
 
+        // In `ZenohRaft` mode, when this KME has no direct QKD link with `target_kme_id`, key
+        // material must be relayed hop-by-hop toward it instead of requiring a direct link (see
+        // `crate::zenoh_transport::routing`): draw keys from the pool shared with the computed
+        // next hop rather than `target_kme_id` itself. `None` (no resolver installed, i.e.
+        // classical HTTPS mode, or the same-KME case) keeps today's behavior unchanged.
+        let pool_kme_id = if origin_kme_id != target_kme_id {
+            match self.key_routing_resolver.read().await.clone() {
+                Some(resolver) => match resolver.next_hop(target_kme_id, &[]) {
+                    Some(next_hop) => next_hop.kme_id,
+                    None => {
+                        warn!("No route to KME {} from KME {}", target_kme_id, origin_kme_id);
+                        return Err(QkdManagerResponse::NotFound);
+                    }
+                },
+                None => {
+                    // No resolver installed: either genuinely classical HTTPS mode (expected), or
+                    // `ZenohRaft` mode where `set_key_routing_resolver` hasn't run yet (this
+                    // KME's Zenoh transport is still starting up, see `zenoh_transport::runtime`)
+                    // - flag the latter loudly since it silently mimics "direct link" behavior.
+                    if target_kme_id != origin_kme_id && !self.qkd_link_directories.read().await.contains_key(&target_kme_id) {
+                        warn!("No key routing resolver installed and no direct QKD link with KME {}: this KME's Zenoh transport may still be starting up", target_kme_id);
+                    }
+                    target_kme_id
+                }
+            }
+        } else {
+            target_kme_id
+        };
+
         export_important_logging_message!(&self, &format!("SAE {} requested a key to communicate with {}", origin_sae_id, target_sae_id));
 
         let mut fetched_preinit_keys: Vec<(i64, String, Vec<u8>)> = Vec::with_capacity(key_count);
         let mut key_ids_blocked_by_this_request: HashSet<i64> = HashSet::with_capacity(key_count);
 
         let mut fetch_preinit_qb = QueryBuilder::new(FETCH_PREINIT_KEY_PREPARED_STATEMENT);
-        fetch_preinit_qb.push_bind(target_kme_id);
+        fetch_preinit_qb.push_bind(pool_kme_id);
 
         {
             let mut blocked_key_ids = self.blocked_key_ids.lock().await;
@@ -469,7 +584,7 @@ impl KeyHandler {
                     }
                 }
                 built_fetch_preinit_qb = sqlx::query(&sql_modified_for_postgres);
-                built_fetch_preinit_qb = built_fetch_preinit_qb.bind(target_kme_id);
+                built_fetch_preinit_qb = built_fetch_preinit_qb.bind(pool_kme_id);
                 if !blocked_key_ids.is_empty() {
                     for id in blocked_key_ids.iter() {
                         built_fetch_preinit_qb = built_fetch_preinit_qb.bind(id.to_owned());
@@ -537,8 +652,8 @@ impl KeyHandler {
                 }
             }
 
-            info!("Sending {} key(s) to KME {} for SAEs {}/{} through the installed inter-KME transport", keys_with_material.len(), target_kme_id, origin_sae_id, target_sae_id);
-            self.activate_keys_on_other_kme(origin_sae_id, target_kme_id, target_sae_id, keys_with_material).map_err(|qkd_manager_activation_error| {
+            info!("Sending {} key(s) to KME {} for SAEs {}/{} through the installed inter-KME transport", keys_with_material.len(), pool_kme_id, origin_sae_id, target_sae_id);
+            self.activate_keys_on_other_kme(origin_sae_id, pool_kme_id, target_sae_id, keys_with_material, target_kme_id, vec![]).map_err(|qkd_manager_activation_error| {
                 error!("Error activating key on other KME");
                 qkd_manager_activation_error
             }).await?;
@@ -599,7 +714,13 @@ impl KeyHandler {
         }))
     }
 
-    pub(crate) async fn activate_key_uuids_sae(&self, origin_sae_id: SaeId, target_sae_id: SaeId, key_uuids_list: Vec<String>) -> Result<QkdManagerResponse, QkdManagerResponse> {
+    /// # Arguments
+    /// * `final_target_kme_id` - The true final destination KME for this key material; equal to
+    ///   `self.this_kme_id` in the classical, non-relay case (the only case possible outside
+    ///   `ZenohRaft` mode)
+    /// * `visited_kme_ids` - Every KME that already handled this key material before this one,
+    ///   including the true origin, used to avoid routing loops if it must be relayed onward
+    pub(crate) async fn activate_key_uuids_sae(&self, origin_sae_id: SaeId, target_sae_id: SaeId, key_uuids_list: Vec<String>, final_target_kme_id: KmeId, visited_kme_ids: Vec<KmeId>) -> Result<QkdManagerResponse, QkdManagerResponse> {
         const GET_PRE_INIT_KEY_PREPARED_STATEMENT: &'static str = "SELECT id, qkd_key, other_kme_id FROM uninit_keys WHERE key_uuid = $1 LIMIT 1;";
         const GET_PRE_INIT_KEY_PREPARED_STATEMENT_MYSQL: &'static str = "SELECT id, qkd_key, other_kme_id FROM uninit_keys WHERE key_uuid = ? LIMIT 1;";
 
@@ -607,6 +728,16 @@ impl KeyHandler {
             DbmsType::MySQL => GET_PRE_INIT_KEY_PREPARED_STATEMENT_MYSQL,
             DbmsType::Postgres | DbmsType::Sqlite => GET_PRE_INIT_KEY_PREPARED_STATEMENT,
         };
+
+        // If this activation was relayed (more than just the true origin's own hop already
+        // visited), the immediate previous hop (last entry) may have just written the raw key
+        // material into this KME's shared QKD-link directory for it (see
+        // `HttpsInterKmeTransport::activate_key_on_remote_kme`) instead of it already sitting in
+        // this KME's own pre-init pool. That sender relies on this KME's directory watcher to
+        // pick the file up before this very request arrives, which is not guaranteed (file
+        // system change notifications can be unreliable across some container/bind-mount
+        // setups) - see the DB-miss fallback below.
+        let immediate_sender_kme_id = (visited_kme_ids.len() > 1).then(|| visited_kme_ids[visited_kme_ids.len() - 1]);
 
         let retrieved_preinit_key_tuples_futures = key_uuids_list.iter().map(async |key_uuid| {
             let stmt = ensure_prepared_statement_ok!(self.db, get_pre_init_key_prepared_statement)?;
@@ -620,6 +751,14 @@ impl KeyHandler {
             let sql_execution_row = match sql_execution_row {
                 Some(row) => row,
                 None => {
+                    // DB miss: if relayed, try reading the file directly instead of only
+                    // trusting the watcher's timing (still covered by the sender's own retry
+                    // loop for genuine races if the file isn't there yet either).
+                    if let Some(sender_kme_id) = immediate_sender_kme_id {
+                        if let Some(key) = self.try_recover_relayed_key_from_shared_folder(sender_kme_id, key_uuid).await {
+                            return Ok((key_uuid.clone(), None, key));
+                        }
+                    }
                     return Err(QkdManagerResponse::NotFound);
                 }
             };
@@ -632,96 +771,153 @@ impl KeyHandler {
                 error!("Error reading SQL statement result: {}", e);
                 QkdManagerResponse::Ko
             })?;
-            Ok((key_uuid.clone(), key_id, key))
+            Ok((key_uuid.clone(), Some(key_id), key))
         });
 
-        let retrieved_preinit_key_tuples: Vec<(String, i64, Vec<u8>)> = join_all(retrieved_preinit_key_tuples_futures).await.into_iter().collect::<Result<Vec<_>, _>>()?;
+        let retrieved_preinit_key_tuples: Vec<(String, Option<i64>, Vec<u8>)> = join_all(retrieved_preinit_key_tuples_futures).await.into_iter().collect::<Result<Vec<_>, _>>()?;
 
-        // If a Raft coordinator is configured, this KME is the slave (it received a push over the
-        // classical inter-KME network): only agree to activate locally once Raft confirms *this
-        // cluster* already committed the master's Syncing proposal for each key. This is a
-        // read-only check: the slave never proposes a transition itself, since the master already
-        // owns and drives both transitions (Generated -> Syncing before this call, Syncing ->
-        // InUse after it returns) -- proposing here again would race with the master and could be
-        // rejected by the leader as a stale transition.
-        if let Some(authorizer) = self.raft_authorizer.read().await.clone() {
-            for (key_uuid, _, _) in &retrieved_preinit_key_tuples {
-                if authorizer.current_state(key_uuid) != Some(ZenohKeyState::Syncing) {
-                    error!("Raft cluster has not committed key {} to Syncing; refusing to activate it locally", key_uuid);
-                    return Err(QkdManagerResponse::RaftConsensusRejected);
+        // The Raft-Syncing gate (see `Self::relay_or_store_keys`) is checked there, only if this
+        // KME turns out to be the final destination - an intermediate relay hop has no business
+        // of its own in the cluster's consensus over a key it never stores.
+
+        // Every matched pre-init key is now consumed (whether stored locally or relayed onward
+        // below), same as before this feature: the classical protocol's shared-pool assumption
+        // means this KME already holds byte-identical material under each uuid, and it must not
+        // be reused for a different exchange.
+        let mut keys = Vec::with_capacity(retrieved_preinit_key_tuples.len());
+        {
+            let mut transaction = self.db.begin().await.map_err(|e| {
+                error!("Error starting SQL transaction: {:?}", e);
+                QkdManagerResponse::Ko
+            })?;
+            for (key_uuid, key_id, key) in retrieved_preinit_key_tuples {
+                // No DB row to delete for keys recovered directly from a relayed file below -
+                // the file itself was already consumed instead.
+                if let Some(key_id) = key_id {
+                    self.delete_pre_init_key_with_id(key_id, Some(&mut transaction)).await.map_err(|e| {
+                        error!("Error deleting pre-init key {}: {:?}", key_id, e);
+                        QkdManagerResponse::Ko
+                    })?;
                 }
+                keys.push((key_uuid, key));
             }
+            transaction.commit().await.map_err(|e| {
+                error!("Error committing SQL transaction: {:?}", e);
+                QkdManagerResponse::Ko
+            })?;
         }
 
-        let mut transaction = self.db.begin().await.map_err(|e| {
-            error!("Error starting SQL transaction: {:?}", e);
-            QkdManagerResponse::Ko
-        })?;
+        self.relay_or_store_keys(origin_sae_id, target_sae_id, keys, final_target_kme_id, visited_kme_ids).await
+    }
 
-        for (key_uuid, key_id, key) in retrieved_preinit_key_tuples {
-            self.insert_activated_key(&key_uuid, &key, origin_sae_id, target_sae_id, Some(&mut transaction)).map_err(|e| {
-                error!("Error inserting activated key: {:?}", e);
-                QkdManagerResponse::Ko
-            }).await?;
-            self.delete_pre_init_key_with_id(key_id, Some(&mut transaction)).await.map_err(|e| {
-                error!("Error deleting pre-init key {}: {:?}", key_id, e);
+    /// Fallback for [`Self::activate_key_uuids_sae`]'s DB miss: reads and consumes a relayed
+    /// key's raw bytes directly from `sender_kme_id`'s shared QKD-link directory by its
+    /// deterministic filename, bypassing this KME's directory watcher entirely. Returns `None`
+    /// (never an error) if the file is missing, unreadable, or the wrong size, so the caller
+    /// falls through to its normal not-found handling.
+    async fn try_recover_relayed_key_from_shared_folder(&self, sender_kme_id: KmeId, key_uuid: &str) -> Option<Vec<u8>> {
+        let directory = self.qkd_link_directories.read().await.get(&sender_kme_id).cloned()?;
+        let file_path = std::path::Path::new(&directory).join(format!("relay_{}.cor", key_uuid));
+        let key = std::fs::read(&file_path).ok()?;
+        if key.len() != crate::QKD_KEY_SIZE_BYTES {
+            error!("Relayed key file {} has unexpected size {} (expected {})", file_path.display(), key.len(), crate::QKD_KEY_SIZE_BYTES);
+            return None;
+        }
+        if let Err(e) = std::fs::remove_file(&file_path) {
+            warn!("Error deleting consumed relayed key file {}: {}", file_path.display(), e);
+        }
+        info!("Recovered relayed key {} directly from shared folder (directory watcher had not picked it up in time)", key_uuid);
+        Some(key)
+    }
+
+    /// Store `keys` locally if this KME is `final_target_kme_id`, or relay them onward toward it
+    /// otherwise (`ZenohRaft` transport mode only - see `crate::zenoh_transport::routing`),
+    /// shared by both [`Self::activate_key_uuids_sae`] (classical HTTPS receiver) and
+    /// [`Self::store_synced_keys_from_remote`] (Zenoh receiver).
+    async fn relay_or_store_keys(&self, origin_sae_id: SaeId, target_sae_id: SaeId, keys: Vec<(String, Vec<u8>)>, final_target_kme_id: KmeId, visited_kme_ids: Vec<KmeId>) -> Result<QkdManagerResponse, QkdManagerResponse> {
+        if final_target_kme_id == self.this_kme_id {
+            // Read-only Raft check: this KME is the true final destination, so only agree to
+            // store the key(s) locally once Raft confirms *this cluster* already committed the
+            // master's Syncing proposal for each of them. Never checked on an intermediate relay
+            // hop above (see the early return below) - only the final destination's own state
+            // transition matters, and non-member bridging KMEs may not track cluster state at all.
+            if let Some(authorizer) = self.raft_authorizer.read().await.clone() {
+                for (key_uuid, _) in &keys {
+                    if authorizer.current_state(key_uuid) != Some(ZenohKeyState::Syncing) {
+                        error!("Raft cluster has not committed key {} to Syncing; refusing to store it locally", key_uuid);
+                        return Err(QkdManagerResponse::RaftConsensusRejected);
+                    }
+                }
+            }
+
+            let mut transaction = self.db.begin().await.map_err(|e| {
+                error!("Error starting SQL transaction: {:?}", e);
                 QkdManagerResponse::Ko
             })?;
 
-            info!("Key {} activated between saes {} and {}", key_uuid, origin_sae_id, target_sae_id);
+            for (key_uuid, key) in &keys {
+                self.insert_activated_key(key_uuid, key, origin_sae_id, target_sae_id, Some(&mut transaction)).map_err(|e| {
+                    error!("Error inserting activated key: {:?}", e);
+                    QkdManagerResponse::Ko
+                }).await?;
+                info!("Key {} activated between saes {} and {}", key_uuid, origin_sae_id, target_sae_id);
+            }
+
+            transaction.commit().await.map_err(|e| {
+                error!("Error committing SQL transaction: {:?}", e);
+                QkdManagerResponse::Ko
+            })?;
+
+            return Ok(QkdManagerResponse::Ok);
         }
 
-        transaction.commit().await.map_err(|e| {
-            error!("Error committing SQL transaction: {:?}", e);
-            QkdManagerResponse::Ko
+        // Not the final destination: relay onward through the installed routing resolver
+        // (installed only in `ZenohRaft` mode - see `Self::set_key_routing_resolver`).
+        let resolver = self.key_routing_resolver.read().await.clone().ok_or_else(|| {
+            error!("Cannot relay key(s) toward KME {}: no routing resolver installed", final_target_kme_id);
+            QkdManagerResponse::MissingRemoteKmeConfiguration
         })?;
-
+        let next_hop = resolver.next_hop(final_target_kme_id, &visited_kme_ids).ok_or_else(|| {
+            error!("No route to KME {} while relaying (already visited: {:?})", final_target_kme_id, visited_kme_ids);
+            QkdManagerResponse::NotFound
+        })?;
+        info!("Relaying {} key(s) toward final KME {} via next hop KME {}", keys.len(), final_target_kme_id, next_hop.kme_id);
+        self.activate_keys_on_other_kme(origin_sae_id, next_hop.kme_id, target_sae_id, keys, final_target_kme_id, visited_kme_ids).await?;
         Ok(QkdManagerResponse::Ok)
     }
 
     /// From a remote KME, over the Zenoh transport only: store key material pushed directly on
     /// the `ext_keys` plane, once this cluster's own Raft view already shows the key as
-    /// `Syncing`. Unlike [`Self::activate_key_uuids_sae`] (classical HTTPS `/keys/activate`
-    /// route), this never reads `uninit_keys`: the key bytes arrive over the wire instead of
-    /// being looked up from a locally pre-shared pool, so there is no pre-init row to consume.
-    pub(crate) async fn store_synced_keys_from_remote(&self, origin_sae_id: SaeId, target_sae_id: SaeId, keys: Vec<(String, Vec<u8>)>) -> Result<QkdManagerResponse, QkdManagerResponse> {
-        // Read-only Raft check, same rationale as `activate_key_uuids_sae`: the master already
-        // owns and drives both transitions, this KME only agrees to store once the cluster
-        // confirms it.
-        if let Some(authorizer) = self.raft_authorizer.read().await.clone() {
-            for (key_uuid, _) in &keys {
-                if authorizer.current_state(key_uuid) != Some(ZenohKeyState::Syncing) {
-                    error!("Raft cluster has not committed key {} to Syncing; refusing to store it locally", key_uuid);
-                    return Err(QkdManagerResponse::RaftConsensusRejected);
-                }
-            }
-        }
-
-        let mut transaction = self.db.begin().await.map_err(|e| {
-            error!("Error starting SQL transaction: {:?}", e);
-            QkdManagerResponse::Ko
-        })?;
-
-        for (key_uuid, key) in &keys {
-            self.insert_activated_key(key_uuid, key, origin_sae_id, target_sae_id, Some(&mut transaction)).map_err(|e| {
-                error!("Error inserting synced key: {:?}", e);
-                QkdManagerResponse::Ko
-            }).await?;
-
-            info!("Key {} synced and stored between saes {} and {}", key_uuid, origin_sae_id, target_sae_id);
-        }
-
-        transaction.commit().await.map_err(|e| {
-            error!("Error committing SQL transaction: {:?}", e);
-            QkdManagerResponse::Ko
-        })?;
-
-        Ok(QkdManagerResponse::Ok)
+    /// `Syncing`, if this KME is the true final destination - or relay it onward otherwise (see
+    /// [`Self::relay_or_store_keys`]). Unlike [`Self::activate_key_uuids_sae`] (classical HTTPS
+    /// `/keys/activate` route), this never reads `uninit_keys`: the key bytes arrive over the
+    /// wire instead of being looked up from a locally pre-shared pool, so there is no pre-init
+    /// row to consume.
+    /// # Arguments
+    /// * `final_target_kme_id` - The true final destination KME for this key material
+    /// * `visited_kme_ids` - Every KME that already handled this key material before this one,
+    ///   including the true origin, used to avoid routing loops if it must be relayed onward
+    pub(crate) async fn store_synced_keys_from_remote(&self, origin_sae_id: SaeId, target_sae_id: SaeId, keys: Vec<(String, Vec<u8>)>, final_target_kme_id: KmeId, visited_kme_ids: Vec<KmeId>) -> Result<QkdManagerResponse, QkdManagerResponse> {
+        // The Raft-Syncing gate (see `Self::relay_or_store_keys`) is checked there, only if this
+        // KME turns out to be the final destination - an intermediate relay hop (possibly not
+        // even a Raft cluster member, e.g. a Raft-client-only bridging KME) has no business of
+        // its own in the cluster's consensus over a key it never stores.
+        self.relay_or_store_keys(origin_sae_id, target_sae_id, keys, final_target_kme_id, visited_kme_ids).await
     }
 
-    async fn activate_keys_on_other_kme(&self, caller_master_sae_id: SaeId, other_kme_id: KmeId, other_sae_id: SaeId, keys: Vec<(String, Vec<u8>)>) -> Result<(), QkdManagerResponse> {
+    /// Ask `other_kme_id` (the immediate next hop, which may or may not be
+    /// `final_target_kme_id` itself - see `crate::zenoh_transport::routing`) to make `keys`
+    /// available for the (`caller_master_sae_id`, `other_sae_id`) SAE pair, through the
+    /// currently installed [`InterKmeTransport`].
+    /// # Arguments
+    /// * `final_target_kme_id` - The true final destination KME for this key material
+    /// * `visited_kme_ids` - Every KME that already handled this key material before this one;
+    ///   this KME's own id is appended before the call, so the callee always observes itself as
+    ///   the last visited hop
+    async fn activate_keys_on_other_kme(&self, caller_master_sae_id: SaeId, other_kme_id: KmeId, other_sae_id: SaeId, keys: Vec<(String, Vec<u8>)>, final_target_kme_id: KmeId, mut visited_kme_ids: Vec<KmeId>) -> Result<(), QkdManagerResponse> {
+        visited_kme_ids.push(self.this_kme_id);
         let transport = self.inter_kme_transport.read().await.clone();
-        transport.activate_key_on_remote_kme(caller_master_sae_id, other_kme_id, other_sae_id, keys).await
+        transport.activate_key_on_remote_kme(caller_master_sae_id, other_kme_id, other_sae_id, keys, final_target_kme_id, visited_kme_ids).await
     }
 
     async fn insert_activated_key(&self, key_uuid: &str, key: &[u8], origin_sae_id: SaeId, target_sae_id: SaeId, transaction: Option<&mut Transaction<'_, Any>>)-> Result<QkdManagerResponse, QkdManagerResponse> {
@@ -1331,7 +1527,7 @@ mod tests {
         }
     }
     impl InterKmeTransport for FakeInterKmeTransport {
-        fn activate_key_on_remote_kme<'a>(&'a self, _caller_master_sae_id: SaeId, _other_kme_id: KmeId, _other_sae_id: SaeId, _keys: Vec<(String, Vec<u8>)>) -> Pin<Box<dyn Future<Output = Result<(), QkdManagerResponse>> + Send + 'a>> {
+        fn activate_key_on_remote_kme<'a>(&'a self, _caller_master_sae_id: SaeId, _other_kme_id: KmeId, _other_sae_id: SaeId, _keys: Vec<(String, Vec<u8>)>, _final_target_kme_id: KmeId, _visited_kme_ids: Vec<KmeId>) -> Pin<Box<dyn Future<Output = Result<(), QkdManagerResponse>> + Send + 'a>> {
             let accept = self.accept;
             Box::pin(async move {
                 if accept {
@@ -1352,6 +1548,75 @@ mod tests {
                 }
             })
         }
+    }
+
+    /// Fake [`KeyRoutingResolver`] for `key_handler.rs`'s own unit tests: always relays toward a
+    /// fixed next hop, regardless of `final_target_kme_id`/`visited_kme_ids`.
+    struct FakeKeyRoutingResolver {
+        next_hop_kme_id: KmeId,
+    }
+    impl crate::zenoh_transport::routing::KeyRoutingResolver for FakeKeyRoutingResolver {
+        fn next_hop(&self, _final_target_kme_id: KmeId, _visited_kme_ids: &[KmeId]) -> Option<crate::zenoh_transport::routing::NextHop> {
+            Some(crate::zenoh_transport::routing::NextHop { kme_id: self.next_hop_kme_id, transport: crate::zenoh_transport::routing::HopTransport::Zenoh })
+        }
+    }
+
+    #[tokio::test]
+    async fn test_store_synced_keys_from_remote_relays_without_raft_gate_when_not_final_destination() {
+        // This KME (id 3, e.g. B2 in the A-B1-B2-C topology) is only relaying toward KME 4: it
+        // must never consult Raft state for a key transition it isn't a party to, even with no
+        // committed state at all for it (which would reject if the gate wrongly applied here).
+        let key_handler = super::KeyHandler::new(":memory:", 3, None).await.unwrap();
+        key_handler.set_raft_authorizer(Arc::new(FakeRaftAuthorizer::with_current_states(vec![]))).await;
+        key_handler.set_key_routing_resolver(Arc::new(FakeKeyRoutingResolver { next_hop_kme_id: 4 })).await;
+        key_handler.set_inter_kme_transport(Arc::new(FakeInterKmeTransport::accepting())).await;
+
+        let key_uuid = uuid::Uuid::from_bytes([9u8; 16]).to_string();
+        let qkd_manager_response = key_handler.store_synced_keys_from_remote(1, 4, vec![(key_uuid, vec![9u8; crate::QKD_KEY_SIZE_BITS / 8])], 4, vec![1, 2, 3]).await;
+        assert_eq!(qkd_manager_response.unwrap(), QkdManagerResponse::Ok);
+    }
+
+    #[tokio::test]
+    async fn test_activate_key_uuids_sae_recovers_relayed_key_from_shared_folder_on_db_miss() {
+        // This KME (id 3, e.g. B2) has no pre-init DB row at all for this uuid: it only exists as
+        // a `relay_*.cor` file the immediate sender (KME 2, `visited_kme_ids`'s last entry) wrote
+        // into the shared QKD-link directory, simulating the directory watcher not having picked
+        // it up yet (e.g. unreliable fs change notifications across a container/bind mount).
+        let key_handler = super::KeyHandler::new(":memory:", 3, None).await.unwrap();
+        let dir = format!("tests/tmp/relay_fallback_test_{}", uuid::Uuid::new_v4());
+        std::fs::create_dir_all(&dir).expect("test dir created");
+        key_handler.add_qkd_link(2, &dir).await.unwrap();
+
+        let key_uuid = uuid::Uuid::from_bytes([10u8; 16]).to_string();
+        let key_bytes = [10u8; crate::QKD_KEY_SIZE_BITS / 8];
+        let relay_file_path = format!("{}/relay_{}.cor", dir, key_uuid);
+        std::fs::write(&relay_file_path, key_bytes).expect("relay file written");
+
+        key_handler.set_key_routing_resolver(Arc::new(FakeKeyRoutingResolver { next_hop_kme_id: 4 })).await;
+        key_handler.set_inter_kme_transport(Arc::new(FakeInterKmeTransport::accepting())).await;
+
+        let qkd_manager_response = key_handler.activate_key_uuids_sae(1, 4, vec![key_uuid], 4, vec![1, 2]).await;
+        assert_eq!(qkd_manager_response.unwrap(), QkdManagerResponse::Ok);
+        assert!(!std::path::Path::new(&relay_file_path).exists(), "relay file should be consumed (deleted)");
+    }
+
+    #[tokio::test]
+    async fn test_add_qkd_link_and_list_qkd_linked_kme_ids() {
+        let key_handler = super::KeyHandler::new(":memory:", 1, None).await.unwrap();
+        assert_eq!(key_handler.list_qkd_linked_kme_ids().await, Vec::<KmeId>::new());
+
+        key_handler.add_qkd_link(2, "raw_keys/kme-a-b1").await.unwrap();
+        assert_eq!(key_handler.list_qkd_linked_kme_ids().await, vec![2]);
+        assert_eq!(key_handler.qkd_link_directories().read().await.get(&2), Some(&"raw_keys/kme-a-b1".to_string()));
+
+        // Idempotent: adding the same link again must not duplicate/fail.
+        key_handler.add_qkd_link(2, "raw_keys/kme-a-b1").await.unwrap();
+        assert_eq!(key_handler.list_qkd_linked_kme_ids().await, vec![2]);
+
+        key_handler.add_qkd_link(3, "raw_keys/kme-a-b2").await.unwrap();
+        let mut linked = key_handler.list_qkd_linked_kme_ids().await;
+        linked.sort();
+        assert_eq!(linked, vec![2, 3]);
     }
 
     #[tokio::test]
@@ -1664,7 +1929,7 @@ mod tests {
         // No committed state at all for this key-id (`current_state` returns `None`): reject.
         key_handler.set_raft_authorizer(Arc::new(FakeRaftAuthorizer::with_current_states(vec![]))).await;
 
-        let qkd_manager_response = key_handler.activate_key_uuids_sae(1, 2, vec![key_uuid]).await;
+        let qkd_manager_response = key_handler.activate_key_uuids_sae(1, 2, vec![key_uuid], 2, vec![]).await;
         assert!(matches!(qkd_manager_response, Err(QkdManagerResponse::RaftConsensusRejected)));
     }
 
@@ -1683,7 +1948,7 @@ mod tests {
 
         key_handler.set_raft_authorizer(Arc::new(FakeRaftAuthorizer::with_current_states(vec![(key_uuid.clone(), ZenohKeyState::Syncing)]))).await;
 
-        let qkd_manager_response = key_handler.activate_key_uuids_sae(1, 2, vec![key_uuid]).await;
+        let qkd_manager_response = key_handler.activate_key_uuids_sae(1, 2, vec![key_uuid], 2, vec![]).await;
         assert_eq!(qkd_manager_response.unwrap(), QkdManagerResponse::Ok);
     }
 
