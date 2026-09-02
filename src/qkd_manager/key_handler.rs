@@ -491,6 +491,15 @@ impl KeyHandler {
 
     pub(crate) async fn get_sae_keys(&self, origin_sae_certificate: &SaeClientCertSerial, target_sae_id: SaeId, key_count: RequestedKeyCount) -> Result<QkdManagerResponse, QkdManagerResponse> {
         const FETCH_PREINIT_KEY_PREPARED_STATEMENT: &'static str = "SELECT id, key_uuid, qkd_key, other_kme_id FROM uninit_keys WHERE other_kme_id = ";
+        // Same as above, but wrapped as a subquery: used when randomization is enabled (see
+        // `RANDOM_KEY_CANDIDATE_POOL_SIZE` below), left unclosed here and closed further down
+        // once the "WHERE"/"AND id NOT IN" filters have been appended.
+        const FETCH_PREINIT_KEY_PREPARED_STATEMENT_RANDOMIZED: &'static str = "SELECT id, key_uuid, qkd_key, other_kme_id FROM (SELECT id, key_uuid, qkd_key, other_kme_id FROM uninit_keys WHERE other_kme_id = ";
+        // When randomizing, wrap the filtered rows in a subquery capped to this many candidates
+        // (ordered by the (other_kme_id, id) index, so no sort is needed to build it) before
+        // applying the costly ORDER BY RANDOM()/RAND(): sorting the whole per-KME backlog at
+        // random for a handful of returned rows does not scale with the backlog size.
+        const RANDOM_KEY_CANDIDATE_POOL_SIZE: i64 = 200;
 
         let should_disable_database_randomization = match std::env::var(crate::DISABLE_KEY_RETRIEVAL_DATABASE_RANDOMIZATION_ENV_VARIABLE) {
             Ok(val) => val == crate::ACTIVATED_ENV_VARIABLE_VALUE,
@@ -543,7 +552,14 @@ impl KeyHandler {
         let mut fetched_preinit_keys: Vec<(i64, String, Vec<u8>)> = Vec::with_capacity(key_count);
         let mut key_ids_blocked_by_this_request: HashSet<i64> = HashSet::with_capacity(key_count);
 
-        let mut fetch_preinit_qb = QueryBuilder::new(FETCH_PREINIT_KEY_PREPARED_STATEMENT);
+        // When randomizing, the base SELECT is wrapped in a subquery capped to
+        // `RANDOM_KEY_CANDIDATE_POOL_SIZE` rows further down, so ORDER BY RANDOM()/RAND() only
+        // ever sorts that small candidate pool instead of the whole per-KME backlog.
+        let mut fetch_preinit_qb = QueryBuilder::new(if should_disable_database_randomization {
+            FETCH_PREINIT_KEY_PREPARED_STATEMENT
+        } else {
+            FETCH_PREINIT_KEY_PREPARED_STATEMENT_RANDOMIZED
+        });
         fetch_preinit_qb.push_bind(pool_kme_id);
 
         {
@@ -560,7 +576,11 @@ impl KeyHandler {
 
 
             if !should_disable_database_randomization {
-                fetch_preinit_qb.push(" ORDER BY ");
+                // Close the candidate-pool subquery (ordered by id, using the (other_kme_id, id)
+                // index: no sort needed to build it), then randomize only within that pool.
+                fetch_preinit_qb.push(" ORDER BY id LIMIT ");
+                fetch_preinit_qb.push_bind(RANDOM_KEY_CANDIDATE_POOL_SIZE);
+                fetch_preinit_qb.push(") random_candidates ORDER BY ");
                 fetch_preinit_qb.push(if self.dbms_type == DbmsType::MySQL { "RAND()" } else { "RANDOM()" });
             }
 
@@ -589,6 +609,9 @@ impl KeyHandler {
                     for id in blocked_key_ids.iter() {
                         built_fetch_preinit_qb = built_fetch_preinit_qb.bind(id.to_owned());
                     }
+                }
+                if !should_disable_database_randomization {
+                    built_fetch_preinit_qb = built_fetch_preinit_qb.bind(RANDOM_KEY_CANDIDATE_POOL_SIZE);
                 }
                 built_fetch_preinit_qb = built_fetch_preinit_qb.bind(key_count as i64);
             }

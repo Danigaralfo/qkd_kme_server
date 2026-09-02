@@ -5,7 +5,8 @@ CREATE TABLE IF NOT EXISTS uninit_keys (
     qkd_key BLOB NOT NULL,
     other_kme_id BIGINT NOT NULL,
     PRIMARY KEY (id),
-    INDEX (id, key_uuid)
+    INDEX (id, key_uuid),
+    INDEX idx_uninitkeys_otherkmeid_id (other_kme_id, id)
 );
 
 

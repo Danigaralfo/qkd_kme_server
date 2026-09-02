@@ -7,6 +7,7 @@ CREATE TABLE IF NOT EXISTS uninit_keys (
 );
 
 CREATE INDEX IF NOT EXISTS idx_uninitkeys_id_keyuuid ON uninit_keys(id, key_uuid);
+CREATE INDEX IF NOT EXISTS idx_uninitkeys_otherkmeid_id ON uninit_keys(other_kme_id, id);
 
 CREATE TABLE IF NOT EXISTS saes (
     sae_id INTEGER PRIMARY KEY NOT NULL,
