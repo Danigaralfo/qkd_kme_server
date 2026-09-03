@@ -15,6 +15,7 @@ use futures::future::join_all;
 use futures::{TryFutureExt, TryStreamExt};
 use log::{error, info, warn};
 use sqlx::any::{AnyArguments, AnyPoolOptions};
+use sqlx::pool::PoolConnectionMetadata;
 use sqlx::{Arguments, Execute, Executor, QueryBuilder, Row, Statement, Transaction};
 use sqlx_core::any::Any;
 use std::cmp::PartialEq;
@@ -119,6 +120,16 @@ impl KeyHandler {
                 .max_lifetime(None)
                 .connect(IN_MEMORY_SQLITE_URI)
                 .await
+        } else if dbms_type == DbmsType::Sqlite {
+            // WAL lets readers proceed while a writer is active (default rollback-journal mode
+            // blocks everyone on a write); busy_timeout makes concurrent writers wait/retry
+            // instead of immediately failing with "database is locked" under load.
+            dbpool
+                .after_connect(|conn, _meta: PoolConnectionMetadata| Box::pin(async move {
+                    conn.execute("PRAGMA journal_mode=WAL; PRAGMA busy_timeout=5000;").await?;
+                    Ok(())
+                }))
+                .connect_lazy(db_uri)
         } else {
             dbpool.connect_lazy(db_uri) // Save costs on Cloud bill
         }.map_err(|e| {
