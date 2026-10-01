@@ -1,8 +1,15 @@
-# ETSI-compliant Quantum Key Distribution (QKD) Key Management Entity server
+# ZenohRaft: ETSI-compliant Quantum Key Distribution (QKD) Key Management Entity server
 
 *The following repository contains an implementation proposal for the KME (Key Management Entity) server defined in the [ETSI QKD standard](docs/etsi_qkd_standard_definition.pdf) for Quantum Key Distribution.*
 
 ---
+
+### AI Usage
+
+This project uses AI for code generation.
+- **Tool**: Claude Sonnet 5
+- **Usage**: Code generation for ZenohRaft model implementation
+- **Validation**: Every generated code is reviewed and tested by a human developer.
 
 ## Introduction
 
