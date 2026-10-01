@@ -11,6 +11,7 @@ mod get_key;
 mod get_key_with_id;
 mod route_entropy;
 mod get_status;
+mod void_keys;
 
 /// Dispatches the request to the correct function
 pub(in crate::routes) async fn key_handler(rcx: &RequestContext<'_>, req: Request<body::Incoming>, uri_segments: &[&str]) -> Result<Response<Full<Bytes>>, Infallible> {
@@ -21,6 +22,8 @@ pub(in crate::routes) async fn key_handler(rcx: &RequestContext<'_>, req: Reques
         ([slave_sae_id, "enc_keys"], &hyper::Method::GET | &hyper::Method::POST) => get_key::route_get_key(rcx, req, slave_sae_id).await,
         // Get key(s) from a slave SAE, with ID provided by the master SAE
         ([slave_sae_id, "dec_keys"], &hyper::Method::GET | &hyper::Method::POST) => get_key_with_id::route_get_key_with_id(rcx, req, slave_sae_id).await,
+        // Void (permanently delete) already-activated key(s), requested by a master SAE
+        ([slave_sae_id, "void_keys"], &hyper::Method::POST) => void_keys::route_void_keys(rcx, req, slave_sae_id).await,
         // Retrieve Shannon's entropy for all stored keys in KME database
         (["entropy", "total"], &hyper::Method::GET) => route_entropy::route_get_entropy_total(rcx, req).await,
         // Route not found

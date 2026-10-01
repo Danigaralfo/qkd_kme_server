@@ -32,6 +32,7 @@ sqlx = {version = "0.8", features = ["all-databases", "runtime-tokio"]}
 futures = "0.3"
 uriparse = "0.6"
 sqlx-core = "0.8"
+zenoh = "1.9"
 
 [target.'cfg(target_os = "macos")'.dependencies]
 reqwest = { version = "0.13", features = ["rustls", "json"], default-features = false }
@@ -39,7 +40,7 @@ rustls = { version = "0.23", features = ["ring"] }
 
 [target.'cfg(not(target_os = "macos"))'.dependencies]
 reqwest = { version = "0.13" , features = ["native-tls", "json"] }
-rustls = { version = "0.23" }
+rustls = { version = "0.23", features = ["ring"] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 openssl = {version = "0.10", features = ["vendored"]} # To allow static linking on Linux

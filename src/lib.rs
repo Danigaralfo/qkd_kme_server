@@ -18,6 +18,7 @@ pub mod qkd_manager;
 pub mod config;
 pub(crate) mod entropy;
 pub mod event_subscription;
+pub mod zenoh_transport;
 
 
 /// Cast a string to an io::Error

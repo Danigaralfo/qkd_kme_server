@@ -3,6 +3,7 @@
 use std::io;
 use serde::{Deserialize, Serialize};
 use crate::{io_err, KmeId, SaeClientCertSerial, SaeId};
+use crate::zenoh_transport::config::ZenohTransportConfig;
 
 /// Whole KME config, to be extracted from JSON
 #[derive(Serialize, Deserialize, Debug)]
@@ -30,6 +31,15 @@ impl Config {
         };
         Ok(config)
     }
+
+    /// Build a `KmeId -> Zenoh node_id` lookup table from `other_kmes[].zenoh_node_id`, used to
+    /// address point-to-point Zenoh topics (e.g. the inter-KME `/kmapi/activate` transport) at the
+    /// right peer when `transport_mode: zenoh_raft`. KMEs with no `zenoh_node_id` set are omitted.
+    pub fn other_kme_zenoh_node_ids(&self) -> std::collections::HashMap<KmeId, String> {
+        self.other_kme_configs.iter()
+            .filter_map(|other_kme| other_kme.zenoh_node_id.clone().map(|node_id| (other_kme.id, node_id)))
+            .collect()
+    }
 }
 
 /// Config for this specific KME, including its ID and paths to certificates
@@ -55,6 +65,35 @@ pub struct ThisKmeConfig {
     pub kmes_https_interface: KMEsHttpsInterfaceConfig,
     /// Optional HTTP interface to see important debugging events
     pub debugging_http_interface: Option<String>,
+    /// Optional log verbosity, one of "error", "warn", "info", "debug" or "trace" (case-insensitive).
+    /// Defaults to "info" if not set or if the value cannot be parsed. Can still be overridden at
+    /// runtime via the `RUST_LOG` environment variable.
+    #[serde(default)]
+    pub log_level: Option<String>,
+    /// Optional Zenoh transport configuration used when the Zenoh+Raft mode is selected
+    #[serde(default)]
+    pub zenoh_transport: Option<ZenohTransportConfig>,
+    /// Transport mode used at startup
+    /// Defaults to HTTPS to keep backward compatibility with existing configurations
+    #[serde(default)]
+    pub transport_mode: TransportMode,
+}
+
+/// Transport mode used to start the server stack
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum TransportMode {
+    /// Start the existing HTTPS-based stack
+    #[serde(alias = "https")]
+    Https,
+    /// Start the Zenoh-based stack
+    ZenohRaft,
+}
+
+impl Default for TransportMode {
+    fn default() -> Self {
+        Self::Https
+    }
 }
 
 /// Config for internal HTTPS interface for SAEs (likely secured local network)
@@ -97,7 +136,12 @@ pub struct OtherKmeConfig {
     /// Client certificate for inter KME HTTPS authentication
     pub(crate) https_client_authentication_certificate: String,
     /// Password for the client certificate
-    pub(crate) https_client_authentication_certificate_password: String
+    pub(crate) https_client_authentication_certificate_password: String,
+    /// Zenoh `node_id` hostname of the other KME, used to address it directly over Zenoh
+    /// (e.g. the `/kmapi/activate` inter-KME transport) when `transport_mode: zenoh_raft`.
+    /// Only required in that mode; ignored otherwise.
+    #[serde(default)]
+    pub(crate) zenoh_node_id: Option<String>
 }
 
 /// Config for specific SAE: its ID, KME ID and optional client certificate serial
@@ -133,6 +177,7 @@ mod tests {
         assert_eq!(config.this_kme_config.kmes_https_interface.server_cert_path, "certs/inter_kmes/kme1_server.crt");
         assert_eq!(config.this_kme_config.kmes_https_interface.server_key_path, "certs/inter_kmes/kme1_server.key");
         assert_eq!(config.this_kme_config.debugging_http_interface, Some("127.0.0.1:8080".to_string()));
+        assert_eq!(config.this_kme_config.transport_mode, super::TransportMode::Https);
         assert_eq!(config.other_kme_configs.len(), 1);
         assert_eq!(config.other_kme_configs[0].id, 2);
         assert_eq!(config.other_kme_configs[0].key_directory_to_watch, "tests/data/raw_keys/kme-1-2");

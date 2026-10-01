@@ -12,14 +12,14 @@ use hyper::server::conn::http1;
 use hyper::service::service_fn;
 use hyper::{Request, Response, StatusCode};
 use hyper_util::rt::TokioIo;
+use log::{Level, LevelFilter, Log, Metadata, Record};
 use std::convert::Infallible;
 use std::future::Future;
 use std::io;
 use std::ops::Deref;
 use std::pin::Pin;
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 use tokio::net::TcpListener;
-use tokio::sync::RwLock;
 
 /// HTTP logging server struct
 #[derive(Debug)]
@@ -87,19 +87,32 @@ impl LoggingHttpServer {
 
     /// Generates JSON array HTTP response containing all received log messages, or HTTP error status if an error occurred
     async fn generate_messages_http_json_response(received_log_messages: &Arc<RwLock<Vec<LoggingMessage>>>) -> Response<Full<Bytes>> {
-        /*let received_log_messages = match received_log_messages.read().await {
+        let received_log_messages = match received_log_messages.read() {
             Ok(messages) => messages,
             Err(_) => {
                 return Response::builder().status(StatusCode::INTERNAL_SERVER_ERROR).body(Full::new(Bytes::from(String::from("Mutex lock error")))).unwrap();
             }
-        };*/
-        let response_str = match serde_json::to_string(&received_log_messages.read().await.deref()) {
+        };
+        let response_str = match serde_json::to_string(received_log_messages.deref()) {
             Ok(response_str) => response_str,
             Err(_) => {
                 return Response::builder().status(StatusCode::INTERNAL_SERVER_ERROR).body(Full::new(Bytes::from(String::from("JSON serialization error")))).unwrap();
             }
         };
         Response::builder().status(StatusCode::OK).header(CONTENT_TYPE, "application/json").body(Full::new(Bytes::from(response_str))).unwrap()
+    }
+
+    /// Synchronously push a message to be displayed on the HTTP page.
+    ///
+    /// Unlike [`notify`](ImportantEventSubscriber::notify), this does not return a `Future`, so it can be called
+    /// directly from a synchronous context such as a [`log::Log`] implementation (e.g. [`FilteredLogForwarder`]),
+    /// which may itself be invoked from within an async task and must not block on a `tokio` lock.
+    /// # Arguments
+    /// * `message` - The message to be displayed
+    pub fn push_message(&self, message: &str) {
+        if let Ok(mut received_log_messages) = self.received_log_messages.write() {
+            received_log_messages.push(LoggingMessage::new(message));
+        }
     }
 }
 
@@ -110,13 +123,63 @@ impl ImportantEventSubscriber for LoggingHttpServer {
     /// # Returns
     /// Result<(), io::Error> - Ok(()) if the message was successfully added, Err(io::Error) otherwise (mutex lock error)
     fn notify(&self, message: &str) -> Pin<Box<dyn Future<Output = Result<(), io::Error>> + Send + '_>> {
-        let message = message.to_string();
-        Box::pin(async move {
-            self.received_log_messages
-                .write().await
-                .push(LoggingMessage::new(&message));
-            Ok(())
-        })
+        self.push_message(message);
+        Box::pin(async move { Ok(()) })
+    }
+}
+
+/// Wraps another [`log::Log`] implementation (typically the console logger) and additionally forwards a
+/// filtered subset of log records - matching a target prefix and a maximum (i.e. least severe) level - to a
+/// [`LoggingHttpServer`]. This lets operationally relevant events (e.g. from the Zenoh/Raft transport) show up
+/// on the debugging web page, without needing to sift through the full, much more verbose (trace/debug-heavy)
+/// console output, and without changing the console output itself.
+pub struct FilteredLogForwarder {
+    inner: Box<dyn Log>,
+    target_prefix: &'static str,
+    max_forwarded_level: LevelFilter,
+    forward_to: Arc<LoggingHttpServer>,
+}
+
+impl FilteredLogForwarder {
+    /// Create a new forwarding logger
+    /// # Arguments
+    /// * `inner` - The wrapped logger, receiving every record unfiltered (e.g. the console logger)
+    /// * `target_prefix` - Only records whose target starts with this prefix are forwarded to `forward_to`
+    /// * `max_forwarded_level` - Only records at this level or more severe (e.g. `Info`) are forwarded to `forward_to`
+    /// * `forward_to` - The logging HTTP server to forward matching records to
+    /// # Returns
+    /// A new FilteredLogForwarder
+    pub fn new(inner: Box<dyn Log>, target_prefix: &'static str, max_forwarded_level: LevelFilter, forward_to: Arc<LoggingHttpServer>) -> Self {
+        Self {
+            inner,
+            target_prefix,
+            max_forwarded_level,
+            forward_to,
+        }
+    }
+}
+
+impl Log for FilteredLogForwarder {
+    fn enabled(&self, metadata: &Metadata) -> bool {
+        self.inner.enabled(metadata)
+    }
+
+    fn log(&self, record: &Record) {
+        self.inner.log(record);
+        if record.level() <= self.max_forwarded_level && record.target().starts_with(self.target_prefix) {
+            let level_str = match record.level() {
+                Level::Error => "ERROR",
+                Level::Warn => "WARN",
+                Level::Info => "INFO",
+                Level::Debug => "DEBUG",
+                Level::Trace => "TRACE",
+            };
+            self.forward_to.push_message(&format!("[{}] {}", level_str, record.args()));
+        }
+    }
+
+    fn flush(&self) {
+        self.inner.flush();
     }
 }
 

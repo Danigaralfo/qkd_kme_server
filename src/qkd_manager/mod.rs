@@ -1,10 +1,13 @@
 //! QKD key handler interface, to communicate with QKD manager thread (authentication, database...)
 
-mod key_handler;
+pub(crate) mod key_handler;
 pub(crate) mod http_response_obj;
 pub(crate) mod http_request_obj;
 mod router;
 mod config_extractor;
+/// Abstraction over how this KME reaches another KME to activate keys (classical HTTPS by
+/// default, or Zenoh+Raft - see [`crate::zenoh_transport::inter_kme_transport`]).
+pub mod inter_kme_transport;
 
 use crate::entropy::{EntropyAccumulator, ShannonEntropyAccumulator};
 use crate::event_subscription::ImportantEventSubscriber;
@@ -69,6 +72,26 @@ impl QkdManager {
     pub async fn from_config(config: &crate::config::Config) -> Result<Arc<Self>, io::Error> {
         let qkd_manager = config_extractor::ConfigExtractor::extract_config_to_qkd_manager(config).await?;
         Ok(qkd_manager)
+    }
+
+    /// This KME's live database connection pool, for other crate-internal subsystems
+    /// (currently only Raft persistence, see `crate::zenoh_transport::persistence`) that
+    /// need to durably store their own state in the same database.
+    pub(crate) fn db_pool(&self) -> sqlx::AnyPool {
+        self.key_handler.db_pool()
+    }
+
+    /// The DBMS backing this KME's database, see [`Self::db_pool`].
+    pub(crate) fn dbms_type(&self) -> key_handler::DbmsType {
+        self.key_handler.dbms_type()
+    }
+
+    /// List every SAE ID currently registered in the database as belonging to this KME, for
+    /// `crate::zenoh_transport` to advertise over its Zenoh registry queryable (see
+    /// `crate::zenoh_transport::runtime`), so newly-discovered KMEs learn about this KME's SAEs
+    /// (and vice versa) without needing a static `saes` config entry anywhere else.
+    pub(crate) async fn own_sae_ids(&self) -> Vec<SaeId> {
+        self.key_handler.get_own_sae_ids().await
     }
 
     /// Add a new QKD key to the database
@@ -143,6 +166,18 @@ impl QkdManager {
         }
     }
 
+    /// Void (permanently delete) already-activated QKD key(s) (shall be called by the master SAE).
+    /// # Arguments
+    /// * `target_sae_id` - The ID of the target (slave) SAE the keys were shared with
+    /// * `auth_client_cert_serial` - The serial number of the client certificate of the caller master SAE, to authenticate and identify it
+    /// * `keys_uuids` - The UUIDs of the keys to void
+    /// # Returns
+    /// Ok if the keys were voided successfully, an error otherwise (e.g. `NotFound` if a key doesn't belong to this SAE pair,
+    /// or `RaftConsensusRejected` if the key isn't currently `InUse` on a cross-KME exchange)
+    pub async fn void_qkd_keys(&self, target_sae_id: SaeId, auth_client_cert_serial: &SaeClientCertSerial, keys_uuids: Vec<String>) -> Result<QkdManagerResponse, QkdManagerResponse> {
+        self.key_handler.void_sae_keys(auth_client_cert_serial, target_sae_id, keys_uuids).await
+    }
+
     /// Add a new SAE to the database (shall be called before SAEs start requesting KME)
     /// # Arguments
     /// * `sae_id` - The ID of the SAE to add
@@ -211,15 +246,62 @@ impl QkdManager {
     /// * `origin_sae_id` - The ID of the origin (master) SAE, belonging to another KME
     /// * `target_sae_id` - The ID of the target (slave) SAE, to which master SAE wants to communicate, belonging to this KME
     /// * `key_uuid` - The UUID of the key to activate
+    /// * `final_target_kme_id` - The true final destination KME for this key material; equal to
+    ///   this KME's own id in the classical, non-relay case (the only case possible outside
+    ///   `ZenohRaft` mode)
+    /// * `visited_kme_ids` - Every KME that already handled this key material before this one,
+    ///   including the true origin, used to avoid routing loops if it must be relayed onward
     /// # Returns
     /// Ok if the key was activated successfully, an error otherwise
-    pub async fn activate_key_from_remote(&self, origin_sae_id: SaeId, target_sae_id: SaeId, key_uuids_list: Vec<String>) -> Result<QkdManagerResponse, QkdManagerResponse> {
+    pub async fn activate_key_from_remote(&self, origin_sae_id: SaeId, target_sae_id: SaeId, key_uuids_list: Vec<String>, final_target_kme_id: KmeId, visited_kme_ids: Vec<KmeId>) -> Result<QkdManagerResponse, QkdManagerResponse> {
         const EXPECTED_QKD_MANAGER_RESPONSE: QkdManagerResponse = QkdManagerResponse::Ok;
 
-        let activate_key_uuid_qkd_manager_response = self.key_handler.activate_key_uuids_sae(origin_sae_id, target_sae_id, key_uuids_list).await?;
+        let activate_key_uuid_qkd_manager_response = self.key_handler.activate_key_uuids_sae(origin_sae_id, target_sae_id, key_uuids_list, final_target_kme_id, visited_kme_ids).await?;
 
         if activate_key_uuid_qkd_manager_response != EXPECTED_QKD_MANAGER_RESPONSE {
             return Err(activate_key_uuid_qkd_manager_response);
+        }
+        Ok(EXPECTED_QKD_MANAGER_RESPONSE)
+    }
+
+    /// From a remote KME, void (permanently delete) already-activated key(s) on this KME, on
+    /// behalf of a master SAE belonging to that remote KME whose `void_qkd_keys` call was already
+    /// authorized by the Raft cluster (see [`crate::zenoh_transport::raft::KeyLifecycleAuthorizer`]).
+    /// # Arguments
+    /// * `key_uuids_list` - The UUIDs of the keys to void
+    /// # Returns
+    /// Ok if the keys were voided successfully, an error otherwise
+    pub async fn void_keys_from_remote(&self, key_uuids_list: Vec<String>) -> Result<QkdManagerResponse, QkdManagerResponse> {
+        const EXPECTED_QKD_MANAGER_RESPONSE: QkdManagerResponse = QkdManagerResponse::Ok;
+
+        let void_key_uuid_qkd_manager_response = self.key_handler.void_key_uuids_sae(key_uuids_list).await?;
+
+        if void_key_uuid_qkd_manager_response != EXPECTED_QKD_MANAGER_RESPONSE {
+            return Err(void_key_uuid_qkd_manager_response);
+        }
+        Ok(EXPECTED_QKD_MANAGER_RESPONSE)
+    }
+
+    /// From a remote KME, over the Zenoh transport only: store key material pushed for a master
+    /// SAE belonging to that remote KME, once this cluster's Raft view already confirmed the
+    /// `Syncing` transition for each key (see
+    /// [`crate::zenoh_transport::inter_kme_transport::ZenohInterKmeTransport`]).
+    /// # Arguments
+    /// * `origin_sae_id` - The ID of the origin (master) SAE, belonging to another KME
+    /// * `target_sae_id` - The ID of the target (slave) SAE, belonging to this KME
+    /// * `keys` - The key-id and key material pairs pushed by the remote KME
+    /// * `final_target_kme_id` - The true final destination KME for this key material
+    /// * `visited_kme_ids` - Every KME that already handled this key material before this one,
+    ///   including the true origin, used to avoid routing loops if it must be relayed onward
+    /// # Returns
+    /// Ok if the keys were stored successfully, an error otherwise
+    pub async fn store_synced_keys_from_remote(&self, origin_sae_id: SaeId, target_sae_id: SaeId, keys: Vec<(String, Vec<u8>)>, final_target_kme_id: KmeId, visited_kme_ids: Vec<KmeId>) -> Result<QkdManagerResponse, QkdManagerResponse> {
+        const EXPECTED_QKD_MANAGER_RESPONSE: QkdManagerResponse = QkdManagerResponse::Ok;
+
+        let store_synced_keys_qkd_manager_response = self.key_handler.store_synced_keys_from_remote(origin_sae_id, target_sae_id, keys, final_target_kme_id, visited_kme_ids).await?;
+
+        if store_synced_keys_qkd_manager_response != EXPECTED_QKD_MANAGER_RESPONSE {
+            return Err(store_synced_keys_qkd_manager_response);
         }
         Ok(EXPECTED_QKD_MANAGER_RESPONSE)
     }
@@ -268,6 +350,65 @@ impl QkdManager {
     /// Ok if the subscriber was added successfully, an error otherwise (likely thread communication error)
     pub async fn add_important_event_subscriber(&self, subscriber: Arc<dyn ImportantEventSubscriber>) -> Result<(), io::Error> {
         self.key_handler.add_important_event_subscriber(subscriber).await
+    }
+
+    /// Set (or replace) the Raft coordinator consulted before accepting sensitive cross-KME
+    /// key-state transitions. Optional and backward-compatible: as long as this is never called,
+    /// this QKD manager behaves exactly as it did before Phase 5 (no consensus gating at all).
+    /// # Arguments
+    /// * `authorizer` - The Raft-backed authorizer to consult from now on
+    pub async fn set_raft_authorizer(&self, authorizer: Arc<dyn crate::zenoh_transport::raft::KeyLifecycleAuthorizer>) {
+        self.key_handler.set_raft_authorizer(authorizer).await
+    }
+
+    /// Set (or replace) the transport used to activate keys on other KMEs. Optional to call:
+    /// as long as this is never invoked, this QKD manager keeps using the classical HTTPS
+    /// transport it is constructed with by default. Used to switch to the Zenoh+Raft transport
+    /// when `transport_mode: ZenohRaft` is configured (see `main.rs`).
+    /// # Arguments
+    /// * `transport` - The inter-KME transport to use from now on
+    pub async fn set_inter_kme_transport(&self, transport: Arc<dyn inter_kme_transport::InterKmeTransport>) {
+        self.key_handler.set_inter_kme_transport(transport).await
+    }
+
+    /// The transport currently installed to activate keys on other KMEs (defaults to classical
+    /// HTTPS). Used by `crate::zenoh_transport::runtime` to capture it before overwriting it with
+    /// a hybrid classical/Zenoh transport in `ZenohRaft` mode.
+    pub(crate) async fn current_inter_kme_transport(&self) -> Arc<dyn inter_kme_transport::InterKmeTransport> {
+        self.key_handler.current_inter_kme_transport().await
+    }
+
+    /// Set (or replace) the resolver used to compute the next hop toward a key's true final
+    /// destination KME, for multi-hop relay across KMEs with no direct QKD link. Optional and
+    /// backward-compatible: as long as this is never called, this QKD manager never relays (a
+    /// direct link to the target KME is always required).
+    /// # Arguments
+    /// * `resolver` - The routing resolver to consult from now on
+    pub async fn set_key_routing_resolver(&self, resolver: Arc<dyn crate::zenoh_transport::routing::KeyRoutingResolver>) {
+        self.key_handler.set_key_routing_resolver(resolver).await
+    }
+
+    /// Shared, thread-safe `KmeId -> directory` map for every KME this KME has a genuine QKD
+    /// link with (see [`Self::add_qkd_link`]), for `crate::zenoh_transport::runtime` to build a
+    /// hybrid classical/Zenoh transport.
+    pub(crate) fn qkd_link_directories(&self) -> Arc<tokio::sync::RwLock<std::collections::HashMap<KmeId, String>>> {
+        self.key_handler.qkd_link_directories()
+    }
+
+    /// Record that this KME has a genuine (real or simulated, via a shared raw key folder)
+    /// direct QKD link with `other_kme_id`, durably in the database, and remember `directory`
+    /// (the shared folder watched for that link).
+    /// # Arguments
+    /// * `other_kme_id` - The other KME this KME has a direct QKD link with
+    /// * `directory` - The shared raw key directory watched for that link
+    pub async fn add_qkd_link(&self, other_kme_id: KmeId, directory: &str) -> Result<QkdManagerResponse, QkdManagerResponse> {
+        self.key_handler.add_qkd_link(other_kme_id, directory).await
+    }
+
+    /// Every KME this KME has a genuine direct QKD link with (see [`Self::add_qkd_link`]), for
+    /// `crate::zenoh_transport::runtime` to advertise over its Zenoh registry queryable.
+    pub(crate) async fn list_qkd_linked_kme_ids(&self) -> Vec<KmeId> {
+        self.key_handler.list_qkd_linked_kme_ids().await
     }
 }
 
@@ -368,6 +509,9 @@ pub enum QkdManagerResponse {
     SaeInfo(SAEInfo),
     /// The operation was successful, the requested KME information is returned (for example if GetKmeIdFromSaeId is called)
     KmeInfo(KMEInfo),
+    /// A Raft-gated cross-KME key-state transition was rejected by the cluster (e.g. the leader
+    /// or a peer did not authorize it, or the coordinator timed out waiting for a decision)
+    RaftConsensusRejected,
 }
 
 
